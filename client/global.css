@@ -1,0 +1,129 @@
+/** @import must precede all other statements */
+@import url("https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Ultra-dark layered backgrounds */
+    --background: 240 24% 2%;
+    --foreground: 210 40% 98%;
+
+    --card: 240 20% 4%;
+    --card-foreground: 210 40% 98%;
+
+    --popover: 240 24% 2%;
+    --popover-foreground: 210 40% 98%;
+
+    /* Brand Colors: Vibrant & Scientific */
+    --primary: 355 78% 56%;
+    --primary-foreground: 210 40% 98%;
+
+    --secondary: 27 87% 67%;
+    --secondary-foreground: 240 24% 2%;
+
+    --muted: 240 18% 8%;
+    --muted-foreground: 215 20.2% 55%;
+
+    --accent: 355 78% 56%;
+    --accent-foreground: 210 40% 98%;
+
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 210 40% 98%;
+
+    --border: 240 18% 8%;
+    --input: 240 18% 8%;
+    --ring: 355 78% 56%;
+
+    --radius: 1rem;
+
+    --sidebar-background: 240 24% 1%;
+    --sidebar-foreground: 210 40% 98%;
+    --sidebar-primary: 355 78% 56%;
+    --sidebar-primary-foreground: 210 40% 98%;
+    --sidebar-accent: 240 18% 6%;
+    --sidebar-accent-foreground: 210 40% 98%;
+    --sidebar-border: 240 18% 6%;
+    --sidebar-ring: 355 78% 56%;
+  }
+
+  .dark {
+    --background: 240 24% 2%;
+    --foreground: 210 40% 98%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans selection:bg-primary/40 selection:text-white antialiased;
+    font-family: 'Plus Jakarta Sans', sans-serif;
+  }
+
+  /* Refined typography hierarchy */
+  h1, h2, h3, h4, h5, h6 {
+    @apply tracking-tight font-bold;
+    letter-spacing: -0.02em;
+  }
+}
+
+@layer components {
+  /* High-end glassmorphism */
+  .premium-glass {
+    @apply bg-white/[0.03] backdrop-blur-xl border border-white/[0.08] rounded-2xl overflow-hidden shadow-[0_8px_32px_rgba(0,0,0,0.5)];
+    position: relative;
+  }
+  
+  .premium-glass::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    border: 1px solid transparent;
+    border-radius: inherit;
+    background: linear-gradient(135deg, rgba(255,255,255,0.1), transparent) border-box;
+    -webkit-mask: linear-gradient(#fff 0 0) padding-box, linear-gradient(#fff 0 0);
+    mask-composite: exclude;
+  }
+
+  .glass-panel-sidebar {
+    @apply bg-black/40 backdrop-blur-2xl border-r border-white/[0.04];
+  }
+
+  /* Refined glows */
+  .red-glow-soft {
+    @apply shadow-[0_0_30px_rgba(230,57,70,0.15)];
+  }
+
+  .orange-glow-soft {
+    @apply shadow-[0_0_30px_rgba(244,162,97,0.15)];
+  }
+
+  .inner-glow {
+    box-shadow: inset 0 0 20px rgba(255,255,255,0.02);
+  }
+
+  /* Scientific text effect */
+  .text-gradient {
+    @apply bg-clip-text text-transparent bg-gradient-to-br from-white via-white to-white/40;
+  }
+
+  .text-brand-gradient {
+    @apply bg-clip-text text-transparent bg-gradient-to-r from-primary to-secondary;
+  }
+}
+
+@layer utilities {
+  .scrollbar-hide::-webkit-scrollbar {
+    display: none;
+  }
+  .scrollbar-hide {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+}

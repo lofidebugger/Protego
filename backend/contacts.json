@@ -1,0 +1,37 @@
+[
+  {
+    "name": "KIMS Hospital",
+    "authority_type": "hospital",
+    "email": "contact@kimshospitals.com"
+  },
+  {
+    "name": "Apollo Hospital Jubilee Hills",
+    "authority_type": "hospital",
+    "email": "enquiry_hyd@apollohospitals.com"
+  },
+  {
+    "name": "Gachibowli Police Station",
+    "authority_type": "police",
+    "email": "gachibowli-police@tspolice.gov.in"
+  },
+  {
+    "name": "Madhapur Police Station",
+    "authority_type": "police",
+    "email": "madhapur-police@tspolice.gov.in"
+  },
+  {
+    "name": "Hyderabad Fire Station",
+    "authority_type": "fire",
+    "email": "firecontrol-hyd@telangana.gov.in"
+  },
+  {
+    "name": "GHMC Head Office",
+    "authority_type": "municipal",
+    "email": "commissioner@ghmc.gov.in"
+  },
+  {
+    "name": "Cyberabad Traffic Police",
+    "authority_type": "traffic",
+    "email": "traffichelp@tspolice.gov.in"
+  }
+]

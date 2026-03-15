@@ -1,0 +1,1727 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+import {
+  Video, MapPin, ShieldAlert, Siren, Play, Pause, Maximize2,
+  Clock, Target, Radio, Wifi, Zap, Cpu, Mail, MessageCircle,
+  Smartphone, MoreVertical, Loader2, CheckCircle, XCircle,
+  Camera, Youtube, ChevronRight
+} from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { cn } from "@/lib/utils";
+import { motion, AnimatePresence } from "framer-motion";
+import { io } from "socket.io-client";
+import { useToast } from "@/components/ui/use-toast";
+
+const API = "http://127.0.0.1:5000";
+
+interface Detection {
+  label: string; confidence: number;
+  bbox: [number, number, number, number];
+  detection_type: string; color: string;
+}
+
+interface Alert {
+  id: string; incident_type: string; feature_name: string;
+  location: string; severity_score: number; groq_description: string;
+  authority_alerted: string[]; vehicle_plates?: string[];
+  screenshot: string; timestamp: string;
+  alert_channels: { telegram: "sent" | "failed"; sms: "sent" | "failed"; email: "sent" | "failed"; };
+  crowd_density?: number; escape_direction?: string;
+  nearby_authorities?: {
+    hospital?: Array<{ name: string; distance_km: number; phone: string }>;
+    police?: Array<{ name: string; distance_km: number; phone: string }>;
+    fire?: Array<{ name: string; distance_km: number; phone: string }>;
+    emergency_numbers?: { police: string; ambulance: string; fire: string; women: string; unified: string };
+  };
+}
+
+interface Stats {
+  total_alerts: number; high_severity: number;
+  authorities_contacted: number; active_cameras: number;
+}
+
+interface GroqThreat {
+  feature?: string;
+  type: string;
+  description: string;
+  severity: number;
+  confidence: number;
+  action: string;
+  evidence?: string;
+}
+
+interface GroqAnalysis {
+  scene: string;
+  people_count: number;
+  vehicles_count: number;
+  threats: GroqThreat[];
+  safe: boolean;
+  timestamp: string;
+  groq_summary?: string;
+}
+
+type CameraTab = "webcam" | "droidcam" | "youtube" | "rtsp";
+
+interface LocationObj {
+  latitude: number;
+  longitude: number;
+  accuracy?: number;
+  full_address?: string;
+  village?: string;
+  city?: string;
+  state?: string;
+  postcode?: string;
+  method: "gps" | "manual";
+}
+
+interface AuthorityRow {
+  name: string;
+  distance_km: number;
+  phone?: string;
+  type?: string;
+  email?: string;
+}
+
+interface NearbyAuthoritiesData {
+  hospital?: AuthorityRow[];
+  police?: AuthorityRow[];
+  fire?: AuthorityRow[];
+  emergency_numbers?: {
+    police: string;
+    ambulance: string;
+    fire: string;
+    women: string;
+    unified: string;
+  };
+}
+
+interface TavilyAuthority {
+  name: string;
+  phone?: string;
+  email?: string;
+  type?: string;
+  address?: string;
+  jurisdiction?: string;
+  source?: string;
+  has_real_phone?: boolean;
+}
+
+interface TavilyAuthoritiesData {
+  hospital?: TavilyAuthority[];
+  police?: TavilyAuthority[];
+  searching?: boolean;
+}
+
+interface CityHospitalRow {
+  name: string;
+  phone?: string;
+  email?: string;
+  type?: string;
+  address?: string;
+  speciality?: string;
+  has_real_phone?: boolean;
+}
+
+interface CityPoliceRow {
+  name: string;
+  phone?: string;
+  email?: string;
+  address?: string;
+  has_real_phone?: boolean;
+}
+
+interface CityAuthoritiesData {
+  nearest_city?: string;
+  hospitals?: CityHospitalRow[];
+  police_stations?: CityPoliceRow[];
+}
+
+// ── LocationPanel ─────────────────────────────────────────────────────────
+function LocationPanel({ onLocationSet }: { onLocationSet: (loc: LocationObj) => void }) {
+  const [detecting, setDetecting] = useState(false);
+  const [location, setLocation] = useState<LocationObj | null>(null);
+  const [manualInput, setManualInput] = useState("");
+  const [error, setError] = useState("");
+
+  const detectGPS = async () => {
+    setDetecting(true);
+    setError("");
+    if (!navigator.geolocation) {
+      setError("GPS not available. Please enter manually.");
+      setDetecting(false);
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(
+      async (pos) => {
+        const lat = pos.coords.latitude;
+        const lng = pos.coords.longitude;
+        const acc = pos.coords.accuracy;
+        try {
+          const res = await fetch(
+            `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json`,
+            { headers: { "User-Agent": "Protego-Safety/1.0" } }
+          );
+          const data = await res.json();
+          const addr = data.address || {};
+          const locationObj: LocationObj = {
+            latitude: lat, longitude: lng, accuracy: acc,
+            full_address: data.display_name,
+            village: addr.village || addr.suburb || addr.town || "",
+            city: addr.city || addr.town || addr.district || "",
+            state: addr.state || "",
+            postcode: addr.postcode || "",
+            method: "gps",
+          };
+          await fetch(`${API}/api/location/set`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(locationObj),
+          });
+          setLocation(locationObj);
+          onLocationSet(locationObj);
+        } catch {
+          const locationObj: LocationObj = {
+            latitude: lat, longitude: lng,
+            full_address: `${lat.toFixed(4)}, ${lng.toFixed(4)}`,
+            method: "gps",
+          };
+          await fetch(`${API}/api/location/set`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(locationObj),
+          }).catch(() => null);
+          setLocation(locationObj);
+          onLocationSet(locationObj);
+        }
+        setDetecting(false);
+      },
+      () => {
+        setError("GPS denied. Please enter location manually below.");
+        setDetecting(false);
+      },
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+    );
+  };
+
+  const setManual = async () => {
+    if (!manualInput.trim()) return;
+    try {
+      const res = await fetch(
+        `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(manualInput)}&format=json&limit=1&countrycodes=in`,
+        { headers: { "User-Agent": "Protego-Safety/1.0" } }
+      );
+      const data = await res.json();
+      if (data.length > 0) {
+        const result = data[0];
+        const locationObj: LocationObj = {
+          latitude: parseFloat(result.lat),
+          longitude: parseFloat(result.lon),
+          full_address: result.display_name,
+          method: "manual",
+        };
+        await fetch(`${API}/api/location/set`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(locationObj),
+        });
+        setLocation(locationObj);
+        onLocationSet(locationObj);
+      } else {
+        setError("Location not found. Try a nearby town name.");
+      }
+    } catch {
+      setError("Could not geocode. Check your connection.");
+    }
+  };
+
+  return (
+    <div style={{
+      background: "#0d0d1a",
+      border: `1px solid ${location ? "#4ade80" : "#4cc9f0"}`,
+      borderRadius: "10px", padding: "14px", marginBottom: "12px",
+    }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: "10px" }}>
+        <p style={{ color: "#4cc9f0", fontWeight: "bold", fontSize: "12px", margin: 0, textTransform: "uppercase", letterSpacing: "1px" }}>
+          📍 Location
+        </p>
+        {location && (
+          <span style={{ background: "#4ade80", color: "#000", fontSize: "9px", padding: "2px 8px", borderRadius: "10px", fontWeight: "bold" }}>
+            {location.method === "gps" ? "🎯 GPS" : "✏️ Manual"}
+          </span>
+        )}
+      </div>
+      {location ? (
+        <div>
+          <p style={{ color: "#4ade80", fontSize: "12px", margin: "0 0 4px", lineHeight: "1.4" }}>
+            {location.village && location.village + ", "}
+            {location.city}
+            {location.state && ", " + location.state}
+            {location.postcode && " - " + location.postcode}
+          </p>
+          <p style={{ color: "#555", fontSize: "10px", margin: "0 0 8px" }}>
+            {location.latitude?.toFixed(4)}, {location.longitude?.toFixed(4)}
+            {location.accuracy && ` · ±${Math.round(location.accuracy)}m`}
+          </p>
+          <button onClick={() => { setLocation(null); setError(""); }}
+            style={{ background: "none", border: "1px solid #333", color: "#666", fontSize: "10px", padding: "3px 8px", borderRadius: "4px", cursor: "pointer" }}>
+            Change
+          </button>
+        </div>
+      ) : (
+        <div>
+          <button onClick={detectGPS} disabled={detecting}
+            style={{ width: "100%", background: detecting ? "#1a2a1a" : "rgba(74,222,128,0.1)", border: "1px solid #4ade80", color: "#4ade80", padding: "8px", borderRadius: "6px", cursor: detecting ? "default" : "pointer", fontSize: "12px", fontWeight: "bold", marginBottom: "8px" }}>
+            {detecting ? "🔄 Detecting..." : "🎯 Auto-Detect My Location"}
+          </button>
+          <div style={{ display: "flex", gap: "6px" }}>
+            <input value={manualInput} onChange={e => setManualInput(e.target.value)}
+              onKeyDown={e => e.key === "Enter" && setManual()}
+              placeholder="Enter village, town, city..."
+              style={{ flex: 1, background: "#111", border: "1px solid #333", color: "#fff", padding: "6px 10px", borderRadius: "6px", fontSize: "12px", outline: "none" }} />
+            <button onClick={setManual}
+              style={{ background: "#1a1a4a", border: "1px solid #4cc9f0", color: "#4cc9f0", padding: "6px 12px", borderRadius: "6px", cursor: "pointer", fontSize: "12px" }}>
+              Set
+            </button>
+          </div>
+          {error && (
+            <p style={{ color: "#f87171", fontSize: "11px", margin: "6px 0 0" }}>⚠️ {error}</p>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── NearbyAuthorities ─────────────────────────────────────────────────────
+function NearbyAuthorities({ nearby }: { nearby?: Alert["nearby_authorities"] }) {
+  if (!nearby) return null;
+  const emergency = nearby.emergency_numbers || {} as NonNullable<typeof nearby>["emergency_numbers"];
+  const hasResults = (nearby.hospital?.length || 0) + (nearby.police?.length || 0) > 0;
+  if (!hasResults && !emergency) return null;
+  return (
+    <div style={{ background: "#0d1a0d", border: "1px solid #4ade80", borderRadius: "8px", padding: "12px", marginTop: "10px" }}>
+      <p style={{ color: "#4ade80", fontWeight: "bold", fontSize: "11px", margin: "0 0 10px", textTransform: "uppercase" }}>📍 Nearby Authorities</p>
+      {nearby.hospital?.slice(0, 2).map((h, i) => (
+        <div key={i} style={{ marginBottom: "8px", paddingBottom: "8px", borderBottom: "1px solid #1a2a1a" }}>
+          <p style={{ color: "#fff", fontSize: "12px", margin: "0 0 2px", fontWeight: "bold" }}>🏥 {h.name}</p>
+          <p style={{ color: "#888", fontSize: "10px", margin: 0 }}>{h.distance_km} km away · 📞 {h.phone}</p>
+        </div>
+      ))}
+      {nearby.police?.slice(0, 2).map((p, i) => (
+        <div key={i} style={{ marginBottom: "8px", paddingBottom: "8px", borderBottom: "1px solid #1a2a1a" }}>
+          <p style={{ color: "#fff", fontSize: "12px", margin: "0 0 2px", fontWeight: "bold" }}>👮 {p.name}</p>
+          <p style={{ color: "#888", fontSize: "10px", margin: 0 }}>{p.distance_km} km away · 📞 {p.phone}</p>
+        </div>
+      ))}
+      {emergency && (
+        <div style={{ background: "#111", borderRadius: "6px", padding: "8px", marginTop: "6px" }}>
+          <p style={{ color: "#666", fontSize: "10px", margin: "0 0 4px", fontWeight: "bold" }}>🆘 Emergency Numbers</p>
+          <p style={{ color: "#4ade80", fontSize: "11px", margin: 0 }}>
+            Police: <strong>100</strong>&nbsp;·&nbsp;Ambulance: <strong>108</strong>&nbsp;·&nbsp;Fire: <strong>101</strong>&nbsp;·&nbsp;All: <strong>112</strong>
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function NearbyAuthoritiesPreview({ nearby }: { nearby: NearbyAuthoritiesData }) {
+  const cards: Array<{ label: string; emoji: string; rows?: AuthorityRow[] }> = [
+    { label: "Hospitals", emoji: "🏥", rows: nearby.hospital },
+    { label: "Police", emoji: "👮", rows: nearby.police },
+    { label: "Fire", emoji: "🚒", rows: nearby.fire },
+  ];
+
+  return (
+    <div className="rounded-2xl border border-white/[0.05] bg-white/[0.02] p-5 space-y-3">
+      <div className="text-[10px] text-primary font-black uppercase tracking-[0.25em]">Nearby Authorities</div>
+      <div className="grid grid-cols-1 gap-2">
+        {cards.filter(card => (card.rows || []).length > 0).map(card => (
+          <div key={card.label} className="rounded-xl border border-white/[0.05] p-3 space-y-1">
+            <div className="text-[9px] text-white/60 uppercase tracking-widest font-black">{card.emoji} {card.label}</div>
+            {(card.rows || []).slice(0, 3).map((row, idx) => (
+              <div key={idx} className="text-[10px] text-white/50">
+                {row.name}{row.distance_km != null ? ` — ${row.distance_km.toFixed(1)}km` : ""}{row.phone ? ` — ${row.phone}` : ""}
+              </div>
+            ))}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function MajorAuthoritiesPreview({ data, loading }: { data: TavilyAuthoritiesData | null; loading: boolean }) {
+  if (loading) {
+    return (
+      <div className="rounded-2xl border border-purple-500/20 bg-purple-500/5 p-5">
+        <div className="text-[10px] text-purple-400 font-black uppercase tracking-[0.25em] mb-3">Major Authorities</div>
+        <div className="text-[10px] text-white/40 animate-pulse">🔍 Searching for major hospitals & police stations...</div>
+      </div>
+    );
+  }
+  if (!data || (!(data.hospital?.length) && !(data.police?.length))) return null;
+  return (
+    <div className="rounded-2xl border border-purple-500/20 bg-purple-500/5 p-5 space-y-3">
+      <div className="text-[10px] text-purple-400 font-black uppercase tracking-[0.25em]">Major Authorities (Web Search)</div>
+      <div className="grid grid-cols-1 gap-2">
+        {(data.hospital || []).length > 0 && (
+          <div className="rounded-xl border border-white/[0.05] p-3 space-y-1">
+            <div className="text-[9px] text-white/60 uppercase tracking-widest font-black">🏥 Top Hospitals</div>
+            {(data.hospital || []).map((h, i) => (
+              <div key={i} className="text-[10px] text-white/50">
+                {h.name}
+                {h.address ? ` — ${h.address}` : ""}
+                {h.phone ? (
+                  <span className={h.has_real_phone ? " text-green-400" : " text-orange-400"}> — {h.phone}</span>
+                ) : null}
+              </div>
+            ))}
+          </div>
+        )}
+        {(data.police || []).length > 0 && (
+          <div className="rounded-xl border border-white/[0.05] p-3 space-y-1">
+            <div className="text-[9px] text-white/60 uppercase tracking-widest font-black">👮 Top Police Stations</div>
+            {(data.police || []).map((p, i) => (
+              <div key={i} className="text-[10px] text-white/50">
+                {p.name}
+                {p.jurisdiction ? ` (${p.jurisdiction})` : ""}
+                {p.phone ? (
+                  <span className={p.has_real_phone ? " text-green-400" : " text-orange-400"}> — {p.phone}</span>
+                ) : null}
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function CityAuthoritiesPreview({ cityAuth, cityAuthLoading }: { cityAuth: CityAuthoritiesData | null; cityAuthLoading: boolean }) {
+  return (
+    <div style={{
+      marginTop: "14px",
+      background: "linear-gradient(135deg, #0a0a1f, #0d0a1a)",
+      border: "1px solid #7c3aed",
+      borderRadius: "12px",
+      padding: "16px",
+      boxShadow: "0 0 15px rgba(124,58,237,0.15)",
+    }}>
+      <div style={{
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "space-between",
+        marginBottom: "12px",
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+          <span style={{ fontSize: "16px" }}>🌐</span>
+          <div>
+            <p style={{
+              color: "#a78bfa",
+              fontWeight: "bold",
+              fontSize: "12px",
+              margin: 0,
+              textTransform: "uppercase",
+              letterSpacing: "1px",
+            }}>
+              Nearest City Authorities
+            </p>
+            {cityAuth?.nearest_city && (
+              <p style={{ color: "#666", fontSize: "10px", margin: "2px 0 0" }}>
+                📍 {cityAuth.nearest_city}
+              </p>
+            )}
+          </div>
+        </div>
+        <span style={{
+          color: "#555",
+          fontSize: "9px",
+          background: "#1a0a2e",
+          padding: "3px 8px",
+          borderRadius: "10px",
+          border: "1px solid #4a1a6e",
+        }}>
+          AI Web Search
+        </span>
+      </div>
+
+      {cityAuthLoading && (
+        <div style={{ textAlign: "center", padding: "16px" }}>
+          <p style={{ color: "#7c3aed", fontSize: "12px", margin: "0 0 4px" }}>
+            🔍 Searching major authorities...
+          </p>
+          <p style={{ color: "#444", fontSize: "10px", margin: 0 }}>
+            Using Tavily + Groq AI
+          </p>
+        </div>
+      )}
+
+      {!cityAuthLoading && !cityAuth && (
+        <p style={{
+          color: "#444",
+          fontSize: "11px",
+          textAlign: "center",
+          padding: "12px",
+          margin: 0,
+        }}>
+          Set location to find major hospitals and police stations in the nearest city
+        </p>
+      )}
+
+      {cityAuth && (
+        <div>
+          {(cityAuth.hospitals?.length || 0) > 0 && (
+            <div style={{ marginBottom: "12px" }}>
+              <p style={{
+                color: "#a78bfa",
+                fontSize: "10px",
+                fontWeight: "bold",
+                margin: "0 0 8px",
+                textTransform: "uppercase",
+                letterSpacing: "0.5px",
+              }}>
+                🏥 Major Hospitals
+              </p>
+              {(cityAuth.hospitals || []).map((h, i) => (
+                <div key={i} style={{
+                  background: "rgba(124,58,237,0.05)",
+                  border: "1px solid #2a1a4a",
+                  borderRadius: "8px",
+                  padding: "10px",
+                  marginBottom: "6px",
+                }}>
+                  <p style={{ color: "#fff", fontSize: "12px", fontWeight: "bold", margin: "0 0 3px" }}>
+                    {h.name}
+                  </p>
+                  {(h.type || h.speciality) && (
+                    <p style={{ color: "#888", fontSize: "10px", margin: "0 0 4px" }}>
+                      {h.type}{h.speciality ? ` · ${h.speciality}` : ""}
+                    </p>
+                  )}
+                  {h.address && (
+                    <p style={{ color: "#555", fontSize: "10px", margin: "0 0 4px" }}>
+                      📍 {h.address.slice(0, 50)}
+                    </p>
+                  )}
+                  <div style={{ display: "flex", gap: "12px", flexWrap: "wrap", marginTop: "2px" }}>
+                    <span style={{
+                      color: h.has_real_phone ? "#4ade80" : "#f97316",
+                      fontSize: "11px",
+                      fontWeight: "bold",
+                    }}>
+                      📞 {h.phone || "108"} {h.has_real_phone ? "✓" : "⚡"}
+                    </span>
+                    {h.email && (
+                      <span style={{ color: "#60a5fa", fontSize: "11px" }}>
+                        ✉️ {h.email}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {(cityAuth.police_stations?.length || 0) > 0 && (
+            <div>
+              <p style={{
+                color: "#a78bfa",
+                fontSize: "10px",
+                fontWeight: "bold",
+                margin: "0 0 8px",
+                textTransform: "uppercase",
+                letterSpacing: "0.5px",
+              }}>
+                👮 Major Police Stations
+              </p>
+              {(cityAuth.police_stations || []).map((p, i) => (
+                <div key={i} style={{
+                  background: "rgba(124,58,237,0.05)",
+                  border: "1px solid #2a1a4a",
+                  borderRadius: "8px",
+                  padding: "10px",
+                  marginBottom: "6px",
+                }}>
+                  <p style={{ color: "#fff", fontSize: "12px", fontWeight: "bold", margin: "0 0 3px" }}>
+                    {p.name}
+                  </p>
+                  {p.address && (
+                    <p style={{ color: "#555", fontSize: "10px", margin: "0 0 4px" }}>
+                      📍 {p.address.slice(0, 50)}
+                    </p>
+                  )}
+                  <div style={{ display: "flex", gap: "12px", flexWrap: "wrap" }}>
+                    <span style={{
+                      color: p.has_real_phone ? "#4ade80" : "#f97316",
+                      fontSize: "11px",
+                      fontWeight: "bold",
+                    }}>
+                      📞 {p.phone || "100"} {p.has_real_phone ? "✓" : "⚡"}
+                    </span>
+                    {p.email && (
+                      <span style={{ color: "#60a5fa", fontSize: "11px" }}>
+                        ✉️ {p.email}
+                      </span>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function GroqSidebar({ groqData, groqLog }: { groqData: GroqAnalysis | null; groqLog: GroqAnalysis[] }) {
+  const isThreat = !!groqData && !groqData.safe && (groqData.threats?.length || 0) > 0;
+
+  return (
+    <div style={{
+      width: "300px",
+      minWidth: "300px",
+      background: "#0d0d1a",
+      border: `1px solid ${isThreat ? "#ef4444" : "#4cc9f0"}`,
+      borderRadius: "12px",
+      padding: "16px",
+      height: "calc(100vh - 120px)",
+      overflowY: "auto",
+      transition: "border-color 0.3s",
+      boxShadow: isThreat ? "0 0 20px rgba(239,68,68,0.3)" : "none"
+    }}>
+      <div style={{
+        display: "flex",
+        alignItems: "center",
+        gap: "8px",
+        marginBottom: "16px",
+        paddingBottom: "12px",
+        borderBottom: "1px solid #1a1a2e"
+      }}>
+        <span style={{
+          fontSize: "18px",
+          animation: groqData ? "none" : "pulse 1.5s infinite"
+        }}>🧠</span>
+        <div>
+          <p style={{
+            color: "#4cc9f0",
+            fontWeight: "bold",
+            margin: 0,
+            fontSize: "13px"
+          }}>
+            GROQ VISION BRAIN
+          </p>
+          <p style={{
+            color: "#666",
+            margin: 0,
+            fontSize: "10px"
+          }}>
+            {groqData ? `Last: ${groqData.timestamp}` : "Waiting for video..."}
+          </p>
+        </div>
+        <div style={{
+          marginLeft: "auto",
+          width: "8px",
+          height: "8px",
+          borderRadius: "50%",
+          background: isThreat ? "#ef4444" : groqData ? "#4ade80" : "#666",
+          boxShadow: isThreat ? "0 0 8px #ef4444" : groqData ? "0 0 8px #4ade80" : "none"
+        }} />
+      </div>
+
+      {!groqData && (
+        <div style={{
+          textAlign: "center",
+          padding: "40px 20px",
+          color: "#444"
+        }}>
+          <p style={{
+            fontSize: "32px",
+            margin: "0 0 12px"
+          }}>
+            👁️
+          </p>
+          <p style={{
+            fontSize: "13px",
+            lineHeight: "1.6"
+          }}>
+            Load a YouTube video to start Groq Vision analysis...
+          </p>
+        </div>
+      )}
+
+      {groqData && (
+        <>
+          <div style={{
+            background: isThreat ? "rgba(239,68,68,0.1)" : "rgba(74,222,128,0.1)",
+            border: `1px solid ${isThreat ? "#ef4444" : "#4ade80"}`,
+            borderRadius: "8px",
+            padding: "12px",
+            marginBottom: "12px"
+          }}>
+            <p style={{
+              color: isThreat ? "#ef4444" : "#4ade80",
+              fontWeight: "bold",
+              fontSize: "11px",
+              margin: "0 0 6px",
+              textTransform: "uppercase",
+              letterSpacing: "1px"
+            }}>
+              {isThreat ? "⚠️ THREAT DETECTED" : "✅ SCENE SAFE"}
+            </p>
+            <p style={{
+              color: "#ccc",
+              fontSize: "12px",
+              margin: "0 0 8px",
+              lineHeight: "1.5"
+            }}>
+              {groqData.scene}
+            </p>
+            <div style={{
+              display: "flex",
+              gap: "12px"
+            }}>
+              <span style={{
+                color: "#888",
+                fontSize: "11px"
+              }}>
+                👥 {groqData.people_count} people
+              </span>
+              <span style={{
+                color: "#888",
+                fontSize: "11px"
+              }}>
+                🚗 {groqData.vehicles_count} vehicles
+              </span>
+            </div>
+          </div>
+
+          {isThreat && groqData.threats.map((t, i) => (
+            <div key={i} style={{
+              background: "rgba(239,68,68,0.08)",
+              border: "1px solid #ef4444",
+              borderRadius: "8px",
+              padding: "12px",
+              marginBottom: "8px"
+            }}>
+              <div style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                marginBottom: "6px"
+              }}>
+                <p style={{
+                  color: "#ef4444",
+                  fontWeight: "bold",
+                  fontSize: "12px",
+                  margin: 0
+                }}>
+                  🚨 {t.feature || t.type}
+                </p>
+                <span style={{
+                  background: "#ef4444",
+                  color: "#fff",
+                  fontSize: "10px",
+                  padding: "2px 6px",
+                  borderRadius: "10px",
+                  fontWeight: "bold"
+                }}>
+                  {t.severity}/10
+                </span>
+              </div>
+              <p style={{
+                color: "#fca5a5",
+                fontSize: "11px",
+                margin: "0 0 6px",
+                lineHeight: "1.5"
+              }}>
+                {t.description}
+              </p>
+              <p style={{
+                color: "#fb923c",
+                fontSize: "11px",
+                margin: "0 0 4px"
+              }}>
+                ⚡ {t.action}
+              </p>
+              <p style={{
+                color: "#666",
+                fontSize: "10px",
+                margin: 0
+              }}>
+                Evidence: {t.evidence || "N/A"}
+                <br />
+                Confidence: {Math.round((t.confidence || 0) * 100)}%
+              </p>
+            </div>
+          ))}
+
+          {groqData.groq_summary && (
+            <div style={{
+              background: "rgba(76,201,240,0.05)",
+              border: "1px solid #1a3a4a",
+              borderRadius: "8px",
+              padding: "10px",
+              marginBottom: "12px"
+            }}>
+              <p style={{
+                color: "#4cc9f0",
+                fontSize: "10px",
+                fontWeight: "bold",
+                margin: "0 0 4px",
+                textTransform: "uppercase"
+              }}>
+                AI Summary
+              </p>
+              <p style={{
+                color: "#888",
+                fontSize: "11px",
+                margin: 0,
+                lineHeight: "1.5"
+              }}>
+                {groqData.groq_summary}
+              </p>
+            </div>
+          )}
+
+          <div style={{
+            borderTop: "1px solid #1a1a2e",
+            paddingTop: "10px"
+          }}>
+            <p style={{
+              color: "#444",
+              fontSize: "10px",
+              margin: "0 0 8px",
+              textTransform: "uppercase",
+              letterSpacing: "1px"
+            }}>
+              Analysis Log
+            </p>
+            {groqLog.map((log, i) => (
+              <div key={i} style={{
+                display: "flex",
+                gap: "6px",
+                marginBottom: "4px",
+                alignItems: "flex-start"
+              }}>
+                <span style={{
+                  color: "#444",
+                  fontSize: "10px",
+                  minWidth: "50px",
+                  flexShrink: 0
+                }}>
+                  {log.timestamp}
+                </span>
+                <span style={{
+                  color: log.safe ? "#4ade80" : "#ef4444",
+                  fontSize: "10px",
+                  lineHeight: "1.4"
+                }}>
+                  {log.safe ? "✅" : "🚨"} {(log.scene || "").substring(0, 45)}...
+                </span>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ── Webcam Tab ─────────────────────────────────────────────────────────────
+function WebcamTab({ onActivate, isActive, detectedLocation, nearbyAuthorities, cityAuth, cityAuthLoading, tavilyData, tavilyLoading }:
+  {
+    onActivate: () => void;
+    isActive: boolean;
+    detectedLocation: string;
+    nearbyAuthorities: NearbyAuthoritiesData;
+    cityAuth: CityAuthoritiesData | null;
+    cityAuthLoading: boolean;
+    tavilyData: TavilyAuthoritiesData | null;
+    tavilyLoading: boolean;
+  }) {
+  return (
+    <div className="space-y-5">
+      <div className="rounded-2xl border border-white/[0.07] bg-white/[0.02] p-6 space-y-4">
+        <div className="flex items-center gap-3">
+          <div className="p-3 rounded-2xl bg-primary/10 border border-primary/20">
+            <Camera className="w-5 h-5 text-primary" />
+          </div>
+          <div>
+            <div className="text-sm font-black uppercase tracking-widest">Laptop Webcam</div>
+            <div className="text-[10px] text-white/40 uppercase tracking-widest">Uses your built-in or USB camera</div>
+          </div>
+        </div>
+
+        <Button
+          onClick={onActivate}
+          className={cn("w-full h-12 rounded-2xl font-black uppercase tracking-widest text-[11px] gap-3",
+            isActive ? "bg-green-500/20 border border-green-500/30 text-green-400 hover:bg-green-500/30"
+              : "bg-primary text-white hover:bg-primary/90")}
+        >
+          {isActive ? (
+            <>
+              <span className="w-2 h-2 rounded-full bg-green-400 inline-block animate-pulse" />
+              Webcam Active
+            </>
+          ) : (
+            <>
+              <Camera className="w-4 h-4" />
+              Activate Webcam
+            </>
+          )}
+        </Button>
+
+        {detectedLocation && detectedLocation !== "Unknown" && (
+          <div className="flex items-center gap-2 text-[11px] text-green-400 font-black uppercase tracking-widest">
+            <MapPin className="w-3.5 h-3.5" />
+            Detected: {detectedLocation}
+          </div>
+        )}
+      </div>
+
+      {Object.keys(nearbyAuthorities).length > 0 && <NearbyAuthoritiesPreview nearby={nearbyAuthorities} />}
+      <CityAuthoritiesPreview cityAuth={cityAuth} cityAuthLoading={cityAuthLoading} />
+      <MajorAuthoritiesPreview data={tavilyData} loading={tavilyLoading} />
+    </div>
+  );
+}
+
+// ── DroidCam Tab ───────────────────────────────────────────────────────────
+function DroidcamTab({
+  onActivate,
+  cityAuth,
+  cityAuthLoading,
+  tavilyData,
+  tavilyLoading,
+}: {
+  onActivate: (ip: string, port: number, name: string) => void;
+  cityAuth: CityAuthoritiesData | null;
+  cityAuthLoading: boolean;
+  tavilyData: TavilyAuthoritiesData | null;
+  tavilyLoading: boolean;
+}) {
+  const [ip, setIp] = useState("");
+  const [port, setPort] = useState("4747");
+  const [name, setName] = useState("");
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<{ ok: boolean; msg: string } | null>(null);
+  const [activating, setActivating] = useState(false);
+  const { toast } = useToast();
+
+  const testConnection = async () => {
+    if (!ip.trim()) { toast({ title: "Enter an IP address first", variant: "destructive" }); return; }
+    setTesting(true); setTestResult(null);
+    try {
+      const res = await fetch(`${API}/api/camera/test`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ip_address: ip, port: Number(port) || 4747 }),
+      });
+      const data = await res.json();
+      setTestResult({ ok: data.success, msg: data.message || (data.success ? "Connection successful!" : "Cannot connect") });
+    } catch { setTestResult({ ok: false, msg: "Network error — is the backend running?" }); }
+    finally { setTesting(false); }
+  };
+
+  const activate = async () => {
+    if (!ip.trim()) { toast({ title: "Enter an IP address", variant: "destructive" }); return; }
+    setActivating(true);
+    try { await onActivate(ip, Number(port) || 4747, name || `DroidCam ${ip}`); }
+    finally { setActivating(false); }
+  };
+
+  return (
+    <div className="space-y-5">
+      <div className="rounded-2xl border border-white/[0.07] bg-white/[0.02] p-6 space-y-4">
+        <div className="flex items-center gap-3">
+          <div className="p-3 rounded-2xl bg-blue-500/10 border border-blue-500/20">
+            <Smartphone className="w-5 h-5 text-blue-400" />
+          </div>
+          <div>
+            <div className="text-sm font-black uppercase tracking-widest">Connect DroidCam</div>
+            <div className="text-[10px] text-white/40 uppercase tracking-widest">Your phone as AI camera</div>
+          </div>
+        </div>
+
+        <div className="space-y-3">
+          <Input value={name} onChange={e => setName(e.target.value)}
+            placeholder="Camera Name (e.g. My Phone Camera)"
+            className="bg-black/40 border-white/10 h-10 rounded-xl text-[12px]" />
+          <div className="grid grid-cols-3 gap-2">
+            <Input value={ip} onChange={e => setIp(e.target.value)}
+              placeholder="192.168.1.X"
+              className="col-span-2 bg-black/40 border-white/10 h-10 rounded-xl text-[12px]" />
+            <Input value={port} onChange={e => setPort(e.target.value)}
+              placeholder="4747"
+              className="bg-black/40 border-white/10 h-10 rounded-xl text-[12px]" />
+          </div>
+          <div className="text-[10px] text-white/30 uppercase tracking-widest">Find this IP in the DroidCam app on your phone</div>
+        </div>
+
+        {testResult && (
+          <div className={cn("flex items-center gap-2 text-[11px] font-black rounded-xl p-3",
+            testResult.ok ? "bg-green-500/10 text-green-400" : "bg-red-500/10 text-red-400")}>
+            {testResult.ok ? <CheckCircle className="w-4 h-4" /> : <XCircle className="w-4 h-4" />}
+            {testResult.msg}
+          </div>
+        )}
+
+        <div className="flex gap-2">
+          <Button onClick={testConnection} disabled={testing} variant="outline"
+            className="flex-1 h-10 rounded-xl border-white/10 text-[10px] font-black uppercase tracking-widest bg-white/[0.03] hover:bg-white/[0.08]">
+            {testing ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : null}
+            Test Connection
+          </Button>
+          <Button onClick={activate} disabled={activating}
+            className="flex-1 h-10 rounded-xl bg-primary text-white hover:bg-primary/90 text-[10px] font-black uppercase tracking-widest">
+            {activating ? <Loader2 className="w-4 h-4 animate-spin mr-2" /> : null}
+            Activate DroidCam
+          </Button>
+        </div>
+      </div>
+
+      <div className="rounded-2xl border border-white/[0.05] bg-white/[0.02] p-5 space-y-3">
+        <div className="text-[10px] text-white/60 font-black uppercase tracking-[0.25em]">Setup Instructions</div>
+        {[
+          "Download DroidCam from the Play Store (free)",
+          "Open DroidCam on your phone",
+          "Note the IP address shown in the app",
+          "Make sure phone and laptop are on the same WiFi",
+          "Enter the IP above and click Activate",
+        ].map((step, i) => (
+          <div key={i} className="flex items-start gap-3 text-[11px] text-white/40">
+            <span className="text-[9px] font-black text-primary uppercase tracking-widest mt-0.5 min-w-[20px]">Step {i + 1}</span>
+            <span>{step}</span>
+          </div>
+        ))}
+      </div>
+      <CityAuthoritiesPreview cityAuth={cityAuth} cityAuthLoading={cityAuthLoading} />
+      <MajorAuthoritiesPreview data={tavilyData} loading={tavilyLoading} />
+    </div>
+  );
+}
+
+// ── YouTube Tab ────────────────────────────────────────────────────────────
+function YoutubeTab({
+  onActivate,
+  selectedLocation,
+  nearbyAuthorities,
+  cityAuth,
+  cityAuthLoading,
+  tavilyData,
+  tavilyLoading,
+}: {
+  onActivate: (url: string, name: string, location: LocationObj) => void;
+  selectedLocation: LocationObj | null;
+  nearbyAuthorities: NearbyAuthoritiesData;
+  cityAuth: CityAuthoritiesData | null;
+  cityAuthLoading: boolean;
+  tavilyData: TavilyAuthoritiesData | null;
+  tavilyLoading: boolean;
+}) {
+  const [url, setUrl] = useState("");
+  const [streamName, setStreamName] = useState("");
+  const [activating, setActivating] = useState(false);
+  const { toast } = useToast();
+
+  const activate = async () => {
+    if (!url.trim()) { toast({ title: "Enter a YouTube URL", variant: "destructive" }); return; }
+    if (!selectedLocation) {
+      toast({ title: "Set a location first", description: "Use the Location panel above before loading the stream.", variant: "destructive" });
+      return;
+    }
+    setActivating(true);
+    try { await onActivate(url, streamName || "YouTube Stream", selectedLocation); }
+    finally { setActivating(false); }
+  };
+
+  return (
+    <div className="space-y-5">
+      <div className="rounded-2xl border border-white/[0.07] bg-white/[0.02] p-6 space-y-4">
+        <div className="flex items-center gap-3">
+          <div className="p-3 rounded-2xl bg-red-500/10 border border-red-500/20">
+            <Youtube className="w-5 h-5 text-red-400" />
+          </div>
+          <div>
+            <div className="text-sm font-black uppercase tracking-widest">YouTube Live Stream</div>
+            <div className="text-[10px] text-white/40 uppercase tracking-widest">Remote camera monitoring</div>
+          </div>
+        </div>
+
+        <div className="space-y-3">
+          <Input value={streamName} onChange={e => setStreamName(e.target.value)}
+            placeholder="Stream Name (e.g. Traffic Camera — MG Road)"
+            className="bg-black/40 border-white/10 h-10 rounded-xl text-[12px]" />
+          <Input value={url} onChange={e => setUrl(e.target.value)}
+            placeholder="https://www.youtube.com/watch?v=..."
+            className="bg-black/40 border-white/10 h-10 rounded-xl text-[12px]" />
+          <div className="text-[10px] text-white/30 uppercase tracking-widest">Must be a YouTube LIVE stream, not a regular video</div>
+        </div>
+
+        <div className="space-y-2">
+          <div className="text-[10px] text-white/60 font-black uppercase tracking-widest flex items-center gap-2">
+            <MapPin className="w-3 h-3 text-primary" /> Stream Location
+          </div>
+          <div className="rounded-xl border border-white/10 bg-black/30 p-3">
+            {selectedLocation ? (
+              <>
+                <div className="text-[12px] text-white font-semibold">
+                  {selectedLocation.full_address || [selectedLocation.village, selectedLocation.city, selectedLocation.state].filter(Boolean).join(", ")}
+                </div>
+                <div className="text-[10px] text-white/40 mt-1">
+                  {selectedLocation.latitude.toFixed(4)}, {selectedLocation.longitude.toFixed(4)}
+                  {selectedLocation.accuracy ? ` · ±${Math.round(selectedLocation.accuracy)}m` : ""}
+                </div>
+              </>
+            ) : (
+              <div className="text-[11px] text-white/40">
+                Use the Location panel above to set the stream location. Nearby police, hospitals, and email targeting will use that location.
+              </div>
+            )}
+          </div>
+        </div>
+
+        <Button onClick={activate} disabled={activating}
+          className="w-full h-12 rounded-2xl bg-primary text-white hover:bg-primary/90 font-black uppercase tracking-widest text-[11px] gap-3">
+          {activating ? <Loader2 className="w-4 h-4 animate-spin" /> : <Youtube className="w-4 h-4" />}
+          {activating ? "Loading Stream..." : "Load Stream"}
+        </Button>
+      </div>
+
+      <div className="rounded-2xl border border-orange-500/20 bg-orange-500/5 p-4 space-y-2">
+        <div className="text-[10px] text-orange-400 font-black uppercase tracking-widest">⚠ Note</div>
+        <div className="text-[11px] text-white/50 leading-relaxed">
+          YouTube stream loading takes 10–15 seconds. yt-dlp must be installed. The selected location above controls nearby authority lookup and email targeting.
+        </div>
+      </div>
+
+      {Object.keys(nearbyAuthorities).length > 0 && <NearbyAuthoritiesPreview nearby={nearbyAuthorities} />}
+      <CityAuthoritiesPreview cityAuth={cityAuth} cityAuthLoading={cityAuthLoading} />
+      <MajorAuthoritiesPreview data={tavilyData} loading={tavilyLoading} />
+    </div>
+  );
+}
+
+// ── Main Component ─────────────────────────────────────────────────────────
+export default function LiveMonitor() {
+  const [alerts, setAlerts] = useState<Alert[]>([]);
+  const [activeTab, setActiveTab] = useState<CameraTab>("webcam");
+  const [isLive, setIsLive] = useState(true);
+  const [stats, setStats] = useState<Stats>({ total_alerts: 0, high_severity: 0, authorities_contacted: 0, active_cameras: 0 });
+  const [cameraStatus, setCameraStatus] = useState<string>("connecting");
+  const [cameraName, setCameraName] = useState<string>("NODE 04");
+  const [activeCamera, setActiveCamera] = useState<CameraTab | null>(null);
+  const [rtspUrl, setRtspUrl] = useState("");
+  const [nearbyAuthorities, setNearbyAuthorities] = useState<NearbyAuthoritiesData>({});
+  const [cityAuth, setCityAuth] = useState<CityAuthoritiesData | null>(null);
+  const [cityAuthLoading, setCityAuthLoading] = useState(false);
+  const [tavilyData, setTavilyData] = useState<TavilyAuthoritiesData | null>(null);
+  const [tavilyLoading, setTavilyLoading] = useState(false);
+  const [activeLocationName, setActiveLocationName] = useState<string>("Unknown");
+  const [groqData, setGroqData] = useState<GroqAnalysis | null>(null);
+  const [groqLog, setGroqLog] = useState<GroqAnalysis[]>([]);
+  const [userLocation, setUserLocation] = useState<LocationObj | null>(null);
+
+  const imgRef = useRef<HTMLImageElement>(null);
+  const isLiveRef = useRef(isLive);
+  isLiveRef.current = isLive;
+
+  const { toast } = useToast();
+
+  const fetchAuthorities = useCallback(async () => {
+    try {
+      const res = await fetch(`${API}/api/authorities/nearby`);
+      const data = await res.json();
+      const payload = data?.data ?? data;
+      setNearbyAuthorities(payload?.authorities || {});
+      setActiveLocationName(payload?.location?.name || payload?.location?.location_name || "Unknown");
+    } catch { /* silently ignore */ }
+  }, []);
+
+  const loadMajorAuthorities = useCallback(async () => {
+    try {
+      setTavilyLoading(true);
+      const res = await fetch(`${API}/api/location/authorities`);
+      const data = await res.json();
+      const payload = data?.data ?? data;
+      if (!payload.searching) {
+        setTavilyData((payload.hospital?.length || payload.police?.length) ? payload : null);
+        setTavilyLoading(false);
+      }
+      // If searching=true, keep spinner — socket tavily_authorities will fire when done
+    } catch {
+      setTavilyLoading(false);
+    }
+  }, []);
+
+  const handleLocationSet = useCallback(async (loc: LocationObj) => {
+    setUserLocation(loc);
+    setCityAuth(null);
+    setCityAuthLoading(true);
+    setActiveLocationName(
+      [loc.village, loc.city, loc.state].filter(Boolean).join(", ") || loc.full_address || "Unknown"
+    );
+    await fetchAuthorities();
+    void loadMajorAuthorities();
+  }, [fetchAuthorities, loadMajorAuthorities]);
+
+  // Initial data fetch and GPS location
+  useEffect(() => {
+    // 1. Fetch initial stats
+    fetch(`${API}/api/stats/today`).then(r => r.json()).then(data => {
+      const p = data?.data ?? data;
+      setStats({ total_alerts: p?.total_incidents || 0, high_severity: p?.high_severity_count || 0, authorities_contacted: p?.authorities_contacted || 0, active_cameras: p?.active_cameras || 0 });
+    }).catch(() => null);
+
+    fetch(`${API}/api/location/search-authorities`, {
+      method: "POST",
+    }).catch(() => {});
+
+    // 2. Browser GPS Collection
+    if ("geolocation" in navigator) {
+      navigator.geolocation.getCurrentPosition(async (position) => {
+        const { latitude, longitude } = position.coords;
+        try {
+          const res = await fetch(`${API}/api/location/update`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ latitude, longitude, location_name: "Browser GPS" })
+          });
+          const data = await res.json();
+          if (data.success) {
+            setActiveLocationName(data.data.location_name);
+            await fetchAuthorities();
+            void loadMajorAuthorities();
+          }
+        } catch (err) {
+          console.error("Failed to update GPS location", err);
+        }
+      }, (error) => {
+        console.warn("Geolocation blocked or failed", error);
+        fetchAuthorities(); // fallback to current server location
+        void loadMajorAuthorities();
+      });
+    } else {
+      fetchAuthorities();
+      void loadMajorAuthorities();
+    }
+  }, [fetchAuthorities, loadMajorAuthorities]);
+
+  // Socket
+  useEffect(() => {
+    const socket = io(API, {
+      transports: ["websocket", "polling"],
+      reconnection: true,
+      reconnectionDelay: 1000,
+      reconnectionAttempts: Infinity,
+    });
+
+    socket.on("connect", () => {
+      setCameraStatus("connected");
+      toast({ title: "Connected to Safety Engine", duration: 2000 });
+    });
+    socket.on("disconnect", () => {
+      setCameraStatus("disconnected");
+      toast({ title: "Connection Lost", description: "Reconnecting...", variant: "destructive" });
+    });
+    socket.on("frame", (data: any) => {
+      if (!isLiveRef.current) return;
+      const b64 = typeof data === "string" ? data : data?.frame;
+      if (b64 && imgRef.current) {
+        imgRef.current.src = `data:image/jpeg;base64,${b64}`;
+      }
+    });
+    socket.on("alert", (alert: Alert) => {
+      setAlerts(prev => [alert, ...prev].slice(0, 50));
+      setStats(prev => ({
+        ...prev, total_alerts: prev.total_alerts + 1,
+        high_severity: alert.severity_score >= 7 ? prev.high_severity + 1 : prev.high_severity,
+        authorities_contacted: prev.authorities_contacted + (alert.authority_alerted?.length ? 1 : 0),
+      }));
+    });
+    socket.on("camera_status", (data: any) => {
+      setCameraStatus(data.status);
+      if (data.camera_name || data.name) setCameraName(data.camera_name || data.name);
+    });
+    socket.on("groq_analysis", (data: GroqAnalysis) => {
+      setGroqData(data);
+      setGroqLog(prev => [data, ...prev.slice(0, 29)]);
+    });
+    socket.on("groq_reset", () => {
+      setGroqData(null);
+      setGroqLog([]);
+    });
+    socket.on("location_updated", (location: LocationObj & { location_name?: string }) => {
+      setUserLocation(location);
+      setCityAuth(null);
+      setCityAuthLoading(true);
+      setActiveLocationName(location.location_name || location.full_address || "Unknown");
+      fetchAuthorities();
+      void loadMajorAuthorities();
+    });
+    socket.on("city_authorities_loading", () => {
+      setCityAuthLoading(true);
+      setCityAuth(null);
+    });
+    socket.on("city_authorities", (data: CityAuthoritiesData) => {
+      setCityAuth(data || null);
+      setCityAuthLoading(false);
+    });
+    socket.on("tavily_authorities", (data: TavilyAuthoritiesData) => {
+      setTavilyData(data || null);
+      setTavilyLoading(false);
+    });
+    return () => {
+      socket.off("city_authorities");
+      socket.off("city_authorities_loading");
+      socket.disconnect();
+    };
+  }, [fetchAuthorities, loadMajorAuthorities, toast]);
+
+  // Activate webcam
+  const activateWebcam = async () => {
+    setCameraStatus("connecting");
+    try {
+      const res = await fetch(`${API}/api/camera/source`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ source_type: "webcam" }),
+      });
+      const data = await res.json();
+      const payload = data?.data ?? data;
+      if (payload?.active_location?.location_name) setActiveLocationName(payload.active_location.location_name);
+      setActiveCamera("webcam");
+      await fetchAuthorities();
+      toast({ title: "Webcam activated", duration: 2000 });
+    } catch (e) {
+      toast({ title: "Failed to activate webcam", variant: "destructive" });
+      setCameraStatus("disconnected");
+    }
+  };
+
+  // Activate DroidCam
+  const activateDroidcam = async (ip: string, port: number, name: string) => {
+    setCameraStatus("connecting");
+    try {
+      const res = await fetch(`${API}/api/camera/source`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ source_type: "ipcam", ip_address: ip, port, camera_name: name }),
+      });
+      const data = await res.json();
+      if (!res.ok) { toast({ title: data?.error || "Failed to connect", variant: "destructive" }); setCameraStatus("disconnected"); return; }
+      setActiveCamera("droidcam");
+      await fetchAuthorities();
+      toast({ title: "DroidCam connected", duration: 2000 });
+    } catch (e) {
+      toast({ title: "Connection error", variant: "destructive" });
+      setCameraStatus("disconnected");
+    }
+  };
+
+  // Activate YouTube
+  const activateYoutube = async (url: string, name: string, location: LocationObj) => {
+    setCameraStatus("connecting");
+    try {
+      const locationName = [location.village, location.city, location.state].filter(Boolean).join(", ") || location.full_address || "Unknown";
+      const res = await fetch(`${API}/api/camera/source`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          source_type: "youtube",
+          url,
+          youtube_url: url,
+          camera_name: name,
+          location_name: locationName,
+          latitude: location.latitude,
+          longitude: location.longitude,
+          location,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) { 
+        toast({ 
+          title: "Stream Loading Failed", 
+          description: data?.error || data?.message || "YouTube stream could not be processed. Please check the URL.", 
+          variant: "destructive" 
+        }); 
+        setCameraStatus("disconnected"); 
+        return; 
+      }
+      setActiveCamera("youtube");
+      setActiveLocationName(locationName);
+      await fetchAuthorities();
+      toast({ 
+        title: "YouTube Stream Initialized", 
+        description: "yt-dlp is extracting the feed. Please wait 10-15 seconds for playback.", 
+        duration: 8000 
+      });
+    } catch (e) {
+      toast({ title: "Stream error", variant: "destructive" });
+      setCameraStatus("disconnected");
+    }
+  };
+
+  const connectRTSP = async () => {
+    if (!rtspUrl.trim()) return;
+    try {
+      const res = await fetch(`${API}/api/camera/source`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          source: "rtsp",
+          url: rtspUrl.trim(),
+        }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        alert(`RTSP Error: ${data.error}`);
+        return;
+      }
+      if (!res.ok) {
+        alert(`RTSP Error: ${data?.message || "Could not connect RTSP stream"}`);
+        return;
+      }
+      setActiveCamera("rtsp");
+      toast({ title: "RTSP stream connected", duration: 3000 });
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const getSeverityStatus = (score: number) => score >= 7 ? "high" : score >= 4 ? "medium" : "low";
+
+  const TABS: { id: CameraTab; label: string; icon: any }[] = [
+    { id: "webcam", label: "📷 Webcam", icon: Camera },
+    { id: "droidcam", label: "📱 DroidCam", icon: Smartphone },
+    { id: "youtube", label: "▶ YouTube", icon: Youtube },
+  ];
+
+  return (
+    <div className="flex flex-col h-full gap-8">
+      {/* Header */}
+      <div className="flex flex-col md:flex-row items-center justify-between gap-6">
+        <div className="flex items-center gap-4">
+          {/* Camera source tabs */}
+          <div className="flex bg-white/[0.03] p-1.5 rounded-[1.25rem] border border-white/[0.05] ring-1 ring-white/[0.02]">
+            {TABS.map(tab => (
+              <Button key={tab.id} variant="ghost" size="sm"
+                className={cn("text-[10px] font-black uppercase tracking-[0.15em] px-5 h-9 transition-all rounded-xl",
+                  activeTab === tab.id ? "bg-white/[0.08] text-white shadow-xl" : "text-white/20 hover:text-white")}
+                onClick={() => setActiveTab(tab.id)}>
+                {tab.label}
+              </Button>
+            ))}
+            <button
+              onClick={() => setActiveTab("rtsp")}
+              style={{
+                height: "36px",
+                borderRadius: "12px",
+                border: "1px solid rgba(76,201,240,0.35)",
+                padding: "0 16px",
+                fontSize: "10px",
+                fontWeight: 800,
+                letterSpacing: "0.15em",
+                textTransform: "uppercase",
+                cursor: "pointer",
+                marginLeft: "6px",
+                background: activeTab === "rtsp" ? "#4cc9f0" : "transparent",
+                color: activeTab === "rtsp" ? "#000" : "#4cc9f0",
+              }}
+            >
+              📡 RTSP
+            </button>
+          </div>
+
+          <div className={cn("flex items-center gap-3 px-4 py-2.5 border rounded-2xl transition-colors",
+            cameraStatus === "connected" ? "bg-primary/20 border-primary/20" :
+              cameraStatus === "connecting" ? "bg-orange-500/20 border-orange-500/20" : "bg-red-900/40 border-red-500/40")}>
+            <Radio className={cn("w-3.5 h-3.5",
+              cameraStatus === "connected" ? "text-primary animate-pulse" :
+                cameraStatus === "connecting" ? "text-orange-400 animate-pulse" : "text-red-500")} />
+            <span className={cn("text-[10px] font-black uppercase tracking-[0.3em]",
+              cameraStatus === "connected" ? "text-primary" : cameraStatus === "connecting" ? "text-orange-400" : "text-red-500")}>
+              {cameraStatus === "connected" ? `LIVE • ${cameraName}` :
+                cameraStatus === "connecting" ? "CONNECTING..." : "DISCONNECTED"}
+            </span>
+          </div>
+        </div>
+
+        <Button size="sm" onClick={() => document.querySelector<HTMLElement>('[data-live-feed]')?.requestFullscreen?.()}
+          className="bg-white text-black hover:bg-white/90 gap-3 h-11 px-8 rounded-2xl text-[10px] font-black uppercase tracking-widest">
+          <Maximize2 className="w-4 h-4" /> Expand Feed
+        </Button>
+      </div>
+
+      <div className="flex-1 grid lg:grid-cols-4 gap-8 overflow-hidden">
+        {/* Left: Feed + Controls */}
+        <div className="lg:col-span-3 flex flex-col gap-6">
+
+          {/* Camera Feed */}
+          <div data-live-feed className="flex-1 premium-glass p-1.5 relative group bg-[#050508] shadow-inner-glow ring-2 ring-white/[0.02] overflow-hidden rounded-3xl" style={{ minHeight: "340px" }}>
+            {cameraStatus === "disconnected" && (
+              <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-black/80 backdrop-blur-md">
+                <Wifi className="w-12 h-12 text-red-500 mb-4 animate-pulse" />
+                <span className="text-xl font-black text-white tracking-widest">CONNECTION LOST</span>
+                <span className="text-sm text-white/50 uppercase tracking-[0.2em] mt-2">Attempting to reconnect...</span>
+              </div>
+            )}
+            {cameraStatus === "connecting" && (
+              <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-black/80 backdrop-blur-md">
+                <Loader2 className="w-12 h-12 text-orange-400 mb-4 animate-spin" />
+                <span className="text-xl font-black text-white tracking-widest">ESTABLISHING CONNECTION</span>
+              </div>
+            )}
+
+            {/* LIVE badge */}
+            <div className="absolute top-4 left-4 z-40 flex items-center gap-2 bg-primary/90 text-white px-3 py-1.5 rounded-full text-[11px] font-black"
+              style={{ display: cameraStatus === "connected" ? "flex" : "none" }}>
+              <span className="w-2 h-2 rounded-full bg-white inline-block animate-pulse" />
+              LIVE
+            </div>
+
+            {/* Stat chips */}
+            <div className="absolute top-4 right-4 z-40 flex flex-wrap gap-2">
+              {[
+                { label: "Stability", val: cameraStatus === "connected" ? "99.9%" : "0%", icon: Wifi },
+                { label: "Compute", val: "42ms", icon: Cpu },
+              ].map(s => (
+                <div key={s.label} className="px-3 py-1.5 bg-black/60 backdrop-blur-2xl rounded-xl border border-white/[0.05] flex items-center gap-2">
+                  <s.icon className="w-3 h-3 text-white/30" />
+                  <div className="flex flex-col">
+                    <span className="text-[7px] text-white/20 uppercase font-black tracking-widest">{s.label}</span>
+                    <span className="text-[10px] font-black">{s.val}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+
+            {/* Live feed img — mutated directly by socket, no React state */}
+            <img ref={imgRef} alt="Live Camera Feed"
+              style={{ width: "100%", height: "100%", objectFit: "cover", display: cameraStatus === "connected" ? "block" : "none" }} />
+            {cameraStatus !== "connected" && (
+              <div className="w-full h-full bg-zinc-900 flex items-center justify-center" style={{ minHeight: "300px" }}>
+                <Video className="w-16 h-16 text-white/10" />
+              </div>
+            )}
+
+            {/* Scanning line */}
+            <div className="absolute inset-8 z-20 pointer-events-none opacity-0 group-hover:opacity-100 transition-opacity duration-700">
+              <motion.div animate={{ top: ["0%", "100%", "0%"] }} transition={{ duration: 6, repeat: Infinity, ease: "linear" }}
+                className="absolute left-0 right-0 h-px bg-primary/40 shadow-[0_0_20px_rgba(230,57,70,0.5)] z-20" />
+            </div>
+
+            {/* Bottom bar */}
+            <div className="absolute bottom-4 left-4 right-4 z-40 p-3 bg-black/40 backdrop-blur-3xl rounded-2xl border border-white/[0.05] flex items-center justify-between opacity-0 group-hover:opacity-100 transition-all duration-500">
+              <div className="flex items-center gap-4">
+                <Button variant="ghost" size="icon" className="w-10 h-10 rounded-xl hover:bg-white/5" onClick={() => setIsLive(!isLive)}>
+                  {isLive ? <Pause className="w-5 h-5 fill-white" /> : <Play className="w-5 h-5 fill-white" />}
+                </Button>
+                <div className="flex flex-col">
+                  <span className="text-xs font-black tracking-widest uppercase">{cameraName}</span>
+                  <span className="text-[8px] text-white/30 uppercase font-black mt-0.5">ENCRYPTED STREAM • AES-256</span>
+                </div>
+              </div>
+              <span className="text-xs font-mono font-bold text-white tracking-widest">
+                {new Date().toLocaleTimeString("en-US", { hour12: false })}
+              </span>
+            </div>
+          </div>
+
+          {/* Camera Source Panel — tab-based, no prompts */}
+          <div className="rounded-3xl premium-glass p-5 bg-white/[0.02] border-white/[0.05] space-y-4">
+            <div className="flex items-center gap-2 text-[10px] text-white/40 font-black uppercase tracking-[0.25em]">
+              <ChevronRight className="w-4 h-4 text-primary" />
+              Camera Source
+            </div>
+            <LocationPanel onLocationSet={handleLocationSet} />
+            {activeTab === "webcam" && (
+              <WebcamTab onActivate={activateWebcam} isActive={activeCamera === "webcam"}
+                detectedLocation={activeLocationName} nearbyAuthorities={nearbyAuthorities}
+                cityAuth={cityAuth} cityAuthLoading={cityAuthLoading}
+                tavilyData={tavilyData} tavilyLoading={tavilyLoading} />
+            )}
+            {activeTab === "droidcam" && <DroidcamTab onActivate={activateDroidcam} cityAuth={cityAuth} cityAuthLoading={cityAuthLoading} tavilyData={tavilyData} tavilyLoading={tavilyLoading} />}
+            {activeTab === "youtube" && <YoutubeTab onActivate={activateYoutube} selectedLocation={userLocation} nearbyAuthorities={nearbyAuthorities} cityAuth={cityAuth} cityAuthLoading={cityAuthLoading} tavilyData={tavilyData} tavilyLoading={tavilyLoading} />}
+            {activeTab === "rtsp" && (
+              <div>
+                <p style={{
+                  color: "#888",
+                  fontSize: "12px",
+                  marginBottom: "8px",
+                }}>
+                  Connect any IP camera,
+                  DVR or government CCTV
+                  that supports RTSP protocol
+                </p>
+                <input
+                  value={rtspUrl}
+                  onChange={e => setRtspUrl(e.target.value)}
+                  placeholder="rtsp://username:password@192.168.1.1:554/stream"
+                  style={{
+                    width: "100%",
+                    background: "#111",
+                    border: "1px solid #333",
+                    color: "#fff",
+                    padding: "8px 10px",
+                    borderRadius: "6px",
+                    fontSize: "11px",
+                    marginBottom: "6px",
+                    boxSizing: "border-box",
+                  }}
+                />
+                <p style={{
+                  color: "#444",
+                  fontSize: "10px",
+                  marginBottom: "10px",
+                }}>
+                  Examples:
+                  rtsp://admin:admin@IP/stream1
+                  rtsp://IP:554/live/ch0
+                </p>
+                <button
+                  onClick={connectRTSP}
+                  style={{
+                    width: "100%",
+                    background: "rgba(76,201,240,0.1)",
+                    border: "1px solid #4cc9f0",
+                    color: "#4cc9f0",
+                    padding: "10px",
+                    borderRadius: "6px",
+                    cursor: "pointer",
+                    fontWeight: "bold",
+                    fontSize: "13px",
+                  }}
+                >
+                  📡 Connect RTSP Stream
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* Stats Row */}
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            {[
+              { label: "Alerts Today", value: stats.total_alerts, icon: Target, color: "text-primary", bg: "bg-primary/10" },
+              { label: "Critical Severity", value: stats.high_severity, icon: ShieldAlert, color: "text-primary", bg: "bg-primary/20", glow: true },
+              { label: "Authorities Alerted", value: stats.authorities_contacted, icon: Siren, color: "text-orange-400", bg: "bg-orange-400/10" },
+              { label: "Active Cameras", value: stats.active_cameras || 1, icon: Radio, color: "text-green-400", bg: "bg-green-400/10" },
+            ].map((stat, idx) => (
+              <div key={idx} className={cn("premium-glass p-5 bg-white/[0.02] border-white/[0.04] flex flex-col gap-3 group hover:bg-white/[0.04] rounded-2xl",
+                stat.glow && "red-glow-soft ring-1 ring-primary/20")}>
+                <div className="flex items-center justify-between">
+                  <div className={cn("p-2 rounded-xl border border-white/5", stat.bg)}>
+                    <stat.icon className={cn("w-4 h-4", stat.color)} />
+                  </div>
+                  <div className="text-[10px] text-white/20 uppercase tracking-[0.2em] font-black">24h</div>
+                </div>
+                <div>
+                  <div className="text-3xl font-black tracking-tighter mb-1">{stat.value}</div>
+                  <div className="text-[10px] text-white/40 uppercase font-black tracking-widest">{stat.label}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Right: Live Alerts Feed + Groq Vision */}
+        <div className="lg:col-span-1 flex flex-col gap-6 max-h-[85vh]">
+          <GroqSidebar groqData={groqData} groqLog={groqLog} />
+
+          <div className="flex items-center justify-between px-2">
+            <div className="flex flex-col">
+              <h3 className="text-[10px] font-black uppercase tracking-[0.4em] text-white/30">Safety Engine</h3>
+              <span className="text-lg font-black tracking-tighter flex items-center gap-2">
+                LIVE ACTIVITY
+                <span className="relative flex h-3 w-3">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-primary opacity-75" />
+                  <span className="relative inline-flex rounded-full h-3 w-3 bg-primary" />
+                </span>
+              </span>
+            </div>
+            <Button variant="ghost" size="icon" className="w-10 h-10 rounded-xl hover:bg-white/5">
+              <MoreVertical className="w-4 h-4 text-white/40" />
+            </Button>
+          </div>
+
+          {alerts.length === 0 && (
+            <div className="flex flex-col items-center justify-center py-16 text-center">
+              <ShieldAlert className="w-10 h-10 text-white/10 mb-3" />
+              <div className="text-[10px] text-white/20 uppercase tracking-widest font-black">No alerts yet</div>
+              <div className="text-[10px] text-white/10 uppercase tracking-widest mt-1">System is monitoring</div>
+            </div>
+          )}
+
+          <div className="flex-1 overflow-auto space-y-4 pr-3 scrollbar-hide pb-20">
+            <AnimatePresence initial={false}>
+              {alerts.map((alert) => {
+                const status = getSeverityStatus(alert.severity_score);
+                return (
+                  <motion.div key={alert.id} initial={{ opacity: 0, height: 0, y: -20 }}
+                    animate={{ opacity: 1, height: "auto", y: 0 }} exit={{ opacity: 0, scale: 0.9, height: 0 }}
+                    className={cn("premium-glass p-4 bg-white/[0.02] border-white/[0.05] group cursor-pointer transition-all hover:bg-white/[0.06] border-l-4 rounded-2xl",
+                      status === "high" ? "border-l-primary" : status === "medium" ? "border-l-orange-500" : "border-l-green-500")}>
+                    <div className="flex flex-col gap-3">
+                      <div className="flex justify-between items-start">
+                        <h4 className="text-xs font-black tracking-tight leading-tight uppercase group-hover:text-primary transition-colors flex items-center gap-2">
+                          <ShieldAlert className="w-4 h-4" />{alert.incident_type}
+                        </h4>
+                        <div className={cn("text-[10px] font-black px-1.5 py-0.5 rounded-lg uppercase tracking-widest whitespace-nowrap",
+                          status === "high" ? "bg-primary/20 text-primary" : status === "medium" ? "bg-orange-500/20 text-orange-400" : "bg-green-500/20 text-green-400")}>
+                          {alert.severity_score}/10
+                        </div>
+                      </div>
+
+                      {alert.screenshot && (
+                        <div className="w-full h-28 rounded-xl overflow-hidden relative">
+                          <img src={`data:image/jpeg;base64,${alert.screenshot}`}
+                            className="w-full h-full object-cover grayscale brightness-75 group-hover:grayscale-0 group-hover:brightness-100 transition-all duration-700"
+                            alt="Incident" onClick={() => window.open(`data:image/jpeg;base64,${alert.screenshot}`, "_blank")} />
+                          <div className="absolute inset-0 bg-gradient-to-t from-black/80 to-transparent pointer-events-none" />
+                          <div className="absolute bottom-2 left-2 text-[9px] uppercase font-black tracking-widest bg-black/60 px-2 py-0.5 rounded border border-white/10">{alert.feature_name}</div>
+                        </div>
+                      )}
+
+                      <div className="text-[10px] text-white/50 leading-relaxed">{alert.groq_description}</div>
+
+                      <NearbyAuthorities nearby={alert.nearby_authorities} />
+
+                      <div className="flex items-center gap-1.5 text-[10px] font-black uppercase tracking-widest text-white/40">
+                        <MapPin className="w-3 h-3 text-primary/60" />
+                        <span className="truncate">{alert.location}</span>
+                      </div>
+
+                      <div className="flex items-center gap-2 mt-1 pt-2 border-t border-white/5">
+                        {alert.alert_channels?.sms && <TooltipIcon icon={MessageCircle} status={alert.alert_channels.sms} label="SMS" />}
+                        {alert.alert_channels?.telegram && <TooltipIcon icon={Smartphone} status={alert.alert_channels.telegram} label="Telegram" />}
+                        {alert.alert_channels?.email && <TooltipIcon icon={Mail} status={alert.alert_channels.email} label="Email" />}
+                        <div className="flex-1 flex justify-end">
+                          <span className="text-[9px] text-white/30 font-black uppercase tracking-widest flex items-center gap-1">
+                            <Clock className="w-3 h-3" />
+                            {alert.timestamp ? new Date(alert.timestamp).toLocaleTimeString("en-US") : "--:--"}
+                          </span>
+                        </div>
+                      </div>
+                    </div>
+                  </motion.div>
+                );
+              })}
+            </AnimatePresence>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TooltipIcon({ icon: Icon, status, label }: { icon: any; status?: "sent" | "failed"; label: string }) {
+  if (!status) return null;
+  return (
+    <div className="group/icon relative flex flex-col items-center">
+      <div className={cn("p-1.5 rounded-md border",
+        status === "sent" ? "bg-green-500/10 border-green-500/20 text-green-400" : "bg-red-500/10 border-red-500/20 text-red-500")}>
+        <Icon className="w-3 h-3" />
+      </div>
+    </div>
+  );
+}
