@@ -1402,7 +1402,11 @@ def _detect_webcam_location() -> dict[str, Any] | None:
 
 def initialize_runtime() -> None:
     _log("initializing Protego runtime...")
-    skip_heavy_models = os.getenv("DISABLE_HEAVY_MODELS", "").strip().lower() in {"1", "true", "yes", "on"}
+    cloud_run_runtime = bool(os.getenv("K_SERVICE"))
+    skip_heavy_models = (
+        os.getenv("DISABLE_HEAVY_MODELS", "").strip().lower() in {"1", "true", "yes", "on"}
+        or cloud_run_runtime
+    )
     
     # Start Telegram polling listener
     threading.Thread(target=_telegram_polling_thread, daemon=True).start()
@@ -1410,7 +1414,8 @@ def initialize_runtime() -> None:
     # Load heavy models only when explicitly enabled.
     if skip_heavy_models:
         _detector.models_loaded = True
-        _log("heavy model loading disabled; using cloud-safe fallback mode")
+        reason = "cloud run runtime" if cloud_run_runtime else "DISABLE_HEAVY_MODELS"
+        _log(f"heavy model loading disabled ({reason}); using cloud-safe fallback mode")
     else:
         # Load heavy models in background so server accepts connections immediately.
         def _model_loader():
@@ -1783,4 +1788,5 @@ if __name__ == "__main__":
         debug=False,
         use_reloader=False,
         log_output=True,
+        allow_unsafe_werkzeug=True,
     )

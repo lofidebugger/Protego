@@ -11,7 +11,6 @@ try:
     import easyocr
 except Exception:  # pragma: no cover - allow cloud runtime without heavy OCR deps
     easyocr = None
-import easyocr
 
 try:
     import google.generativeai as genai
@@ -21,7 +20,6 @@ except Exception:  # pragma: no cover - allows runtime without Gemini client
 
 class ANPRReader:
     def __init__(self) -> None:
-        try:
         if easyocr is None:
             self.reader = None
             self._log("EasyOCR package unavailable. ANPR disabled in this runtime.")
