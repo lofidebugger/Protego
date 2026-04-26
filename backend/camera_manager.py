@@ -70,9 +70,11 @@ class CameraManager:
                 "Accept-Language": "en-US,en;q=0.9",
                 "Accept": "text/html,application/xhtml+xml,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             },
-            "format": "best[ext=mp4]/best",
+            "format": "best/bestvideo+bestaudio/worst",
+            "format_sort": ["res:720", "ext:mp4:m4a"],
+            "ignore_no_formats_error": True,
             "noplaylist": True,
-            "extractor_args": {"youtube": {"player_client": ["android"]}},
+            # "extractor_args": {"youtube": {"player_client": ["android"]}},
         }
         if os.path.exists(COOKIES_PATH):
             opts["cookiefile"] = COOKIES_PATH
