@@ -30,7 +30,7 @@ interface AnalysisResult {
     incident_type: string;
     severity_score: number;
     confidence: number;
-    groq_description: string;
+    gemini_description: string;
     threat_level: string;
     screenshot?: string;
   }>;
@@ -327,7 +327,7 @@ export default function VideoAnalyzer() {
                       </div>
 
                       <p className="text-sm text-gray-700 leading-relaxed">
-                        {alert.groq_description || "No description available"}
+                        {alert.gemini_description || "No description available"}
                       </p>
                     </div>
                   ))}

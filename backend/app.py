@@ -16,6 +16,8 @@ import time
 import threading
 import tempfile
 import uuid
+import random
+import string
 from datetime import datetime, timezone
 from typing import Any
 from werkzeug.utils import secure_filename
@@ -89,14 +91,14 @@ COLOR_BY_DRAW_TYPE = {
 }
 
 MODEL_NAME_BY_FEATURE = {
-    "feat-1": "MediaPipe Hands + Pose + Groq Vision",
-    "feat-2": "YOLOv8 + DeepSort + ANPR + Groq Vision",
-    "feat-3": "MediaPipe Pose + DeepSort + Groq Vision",
+    "feat-1": "MediaPipe Hands + Pose + Gemini 2.5 Flash",
+    "feat-2": "YOLOv8 + DeepSort + ANPR + Gemini 2.5 Flash",
+    "feat-3": "MediaPipe Pose + DeepSort + Gemini 2.5 Flash",
     "feat-4": "YOLOv8 + Crowd Motion Heuristics",
-    "feat-5": "DeepSort + ANPR + Groq Vision",
-    "feat-6": "YOLOv8 + DeepSort + ANPR + Groq Vision",
-    "feat-7": "YOLOv8 + DeepSort + ANPR + Groq Vision",
-    "feat-8": "YOLOv8 Fire Detection + Groq Vision",
+    "feat-5": "DeepSort + ANPR + Gemini 2.5 Flash",
+    "feat-6": "YOLOv8 + DeepSort + ANPR + Gemini 2.5 Flash",
+    "feat-7": "YOLOv8 + DeepSort + ANPR + Gemini 2.5 Flash",
+    "feat-8": "YOLOv8 Fire Detection + Gemini 2.5 Flash",
 }
 
 
@@ -115,12 +117,12 @@ _runtime = {
     "last_processing_fps": 0.0,
     "detection_loop_running": False,
     "feature_loop_running": False,
-    "youtube_groq_loop_running": False,
+    "youtube_gemini_loop_running": False,
 }
 
-groq_yt_running = False
-groq_yt_lock = threading.Lock()
-latest_groq_result: dict[str, Any] | None = None
+gemini_yt_running = False
+gemini_yt_lock = threading.Lock()
+latest_gemini_result: dict[str, Any] | None = None
 
 _active_location = {
     "mode": "manual",
@@ -145,6 +147,48 @@ def _set_active_location(location_name: str, latitude: float, longitude: float, 
     _active_location["longitude"] = float(longitude)
     _active_location["source_type"] = source_type
     _active_location["updated_at"] = _utc_now()
+
+
+def _telegram_polling_thread():
+    """Background listener for /start <code> messages to link judge's Telegram chat ID."""
+    _log("Starting Telegram registration listener...")
+    last_update_id = 0
+    while True:
+        try:
+            if not _alert_system.telegram_token:
+                time.sleep(10)
+                continue
+                
+            url = f"https://api.telegram.org/bot{_alert_system.telegram_token}/getUpdates"
+            params = {"offset": last_update_id + 1, "timeout": 30}
+            resp = requests.get(url, params=params, timeout=35)
+            if resp.status_code == 200:
+                data = resp.json()
+                for update in data.get("result", []):
+                    last_update_id = update["update_id"]
+                    message = update.get("message", {})
+                    text = str(message.get("text", "")).strip()
+                    chat_id = message.get("chat", {}).get("id")
+                    
+                    if text.startswith("/start"):
+                        parts = text.split()
+                        if len(parts) > 1:
+                            code = parts[1]
+                            if str(_alert_system.session_telegram_code) == str(code):
+                                _alert_system.session_telegram_chat_id = str(chat_id)
+                                _log(f"Telegram registered successfully for chat_id: {chat_id}")
+                                # Send confirmation
+                                confirm_url = f"https://api.telegram.org/bot{_alert_system.telegram_token}/sendMessage"
+                                requests.post(confirm_url, json={
+                                    "chat_id": chat_id,
+                                    "text": "✅ Protego Safety Dashboard connected! You will now receive critical alerts, AI descriptions, and voice notes here."
+                                }, timeout=5)
+                                # Emit to frontend
+                                socketio.emit("telegram_registered", {"status": "connected", "chat_id": chat_id})
+        except Exception as e:
+            # Silent fail for network issues to avoid log spam
+            pass
+        time.sleep(2)
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
@@ -215,8 +259,8 @@ def detection_loop() -> None:
                     "annotated_frame": results,
                     "detections": [],
                     "alerts": [],
-                    "groq_analysis": None,
-                    "groq_alerts": [],
+                    "gemini_analysis": None,
+                    "gemini_alerts": [],
                     "features_status": _detector.get_features_status(),
                     "processing_fps": 0.0,
                 }
@@ -234,30 +278,36 @@ def detection_loop() -> None:
                 {"detections": [_normalize_detection_for_frontend(d) for d in detections]},
             )
 
-            groq_analysis = results.get("groq_analysis")
-            if groq_analysis:
-                socketio.emit("groq_analysis", groq_analysis)
+            gemini_analysis = results.get("gemini_analysis")
+            if gemini_analysis:
+                socketio.emit("gemini_analysis", gemini_analysis)
 
-            groq_alerts = results.get("groq_alerts", []) or []
-            for groq_alert in groq_alerts:
-                groq_alert["location"] = _active_location.get("location_name", groq_alert.get("location", "Unknown Location"))
-                groq_alert["camera_latitude"] = _active_location.get("latitude", 0.0)
-                groq_alert["camera_longitude"] = _active_location.get("longitude", 0.0)
+            gemini_alerts = results.get("gemini_alerts", []) or []
+            for gemini_alert in gemini_alerts:
+                gemini_alert["location"] = _active_location.get("location_name", gemini_alert.get("location", "Unknown Location"))
+                gemini_alert["camera_latitude"] = _active_location.get("latitude", 0.0)
+                gemini_alert["camera_longitude"] = _active_location.get("longitude", 0.0)
                 try:
-                    send_result = _alert_system.send_alert(groq_alert)
+                    send_result = _alert_system.send_alert(gemini_alert)
                     if isinstance(send_result, dict):
-                        groq_alert["alert_channels"]["telegram"] = send_result.get("telegram", groq_alert["alert_channels"].get("telegram", "failed"))
-                        groq_alert["alert_channels"]["sms"] = send_result.get("whatsapp", groq_alert["alert_channels"].get("sms", "failed"))
-                        groq_alert["alert_channels"]["email"] = send_result.get("email", groq_alert["alert_channels"].get("email", "failed"))
+                        gemini_alert["alert_channels"]["telegram"] = send_result.get("telegram", gemini_alert["alert_channels"].get("telegram", "failed"))
+                        gemini_alert["alert_channels"]["sms"] = send_result.get("whatsapp", gemini_alert["alert_channels"].get("sms", "failed"))
+                        gemini_alert["alert_channels"]["email"] = send_result.get("email", gemini_alert["alert_channels"].get("email", "failed"))
                 except Exception as exc:
-                    _log(f"groq alert notify failed: {exc}")
-                socketio.emit("alert", groq_alert)
-                _log(f"groq alert fired: {groq_alert.get('incident_type')} @ {groq_alert.get('location')}")
+                    _log(f"gemini alert notify failed: {exc}")
+                socketio.emit("alert", gemini_alert)
+                popup = gemini_alert.get("pending_popup")
+                if popup:
+                    socketio.emit("popup", popup)
+                _log(f"gemini alert fired: {gemini_alert.get('incident_type')} @ {gemini_alert.get('location')}")
 
             camera_info = _build_camera_info()
             confirmed_alerts = _rules.process_detections(results, camera_info)
             for alert_obj in confirmed_alerts:
                 socketio.emit("alert", alert_obj)
+                popup = alert_obj.get("pending_popup")
+                if popup:
+                    socketio.emit("popup", popup)
                 _log(f"alert fired: {alert_obj.get('incident_type')} @ {alert_obj.get('location')}")
 
         except Exception as exc:
@@ -271,12 +321,15 @@ def send_all_alerts(incident: dict[str, Any], screenshot: str | None = None) -> 
         payload = dict(incident)
         if screenshot is not None:
             payload["screenshot"] = screenshot
-        _alert_system.send_alert(payload)
+        sent = _alert_system.send_alert(payload)
+        popup = sent.get("pending_popup") if isinstance(sent, dict) else None
+        if popup:
+            socketio.emit("popup", popup)
     except Exception as exc:
         _log(f"send_all_alerts failed: {exc}")
 
 
-def handle_groq_threat(threat: dict[str, Any], frame: Any, full_result: dict[str, Any]) -> None:
+def handle_gemini_threat(threat: dict[str, Any], frame: Any, full_result: dict[str, Any]) -> None:
     try:
         import base64
         import cv2
@@ -287,14 +340,14 @@ def handle_groq_threat(threat: dict[str, Any], frame: Any, full_result: dict[str
         description = str(threat.get("description", ""))
         action = str(threat.get("action", ""))
 
-        if not hasattr(handle_groq_threat, "_cooldowns"):
-            handle_groq_threat._cooldowns = {}
+        if not hasattr(handle_gemini_threat, "_cooldowns"):
+            handle_gemini_threat._cooldowns = {}
 
         now = time.time()
-        last = handle_groq_threat._cooldowns.get(feature, 0.0)
+        last = handle_gemini_threat._cooldowns.get(feature, 0.0)
         if now - last < 300:
             return
-        handle_groq_threat._cooldowns[feature] = now
+        handle_gemini_threat._cooldowns[feature] = now
 
         ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
         if not ok:
@@ -312,7 +365,7 @@ def handle_groq_threat(threat: dict[str, Any], frame: Any, full_result: dict[str
             "description": description,
             "action": action,
             "location": loc_str,
-            "detected_by": "Groq Vision AI",
+            "detected_by": "Gemini 2.5 Flash",
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "screenshot": screenshot,
         }
@@ -321,12 +374,12 @@ def handle_groq_threat(threat: dict[str, Any], frame: Any, full_result: dict[str
         socketio.emit(
             "alert",
             {
-                "id": f"groq-yt-{int(now * 1000)}",
+                "id": f"gemini-yt-{int(now * 1000)}",
                 "incident_type": feature,
-                "feature_name": "Groq Vision AI",
+                "feature_name": "Gemini 2.5 Flash",
                 "location": loc_str,
                 "severity_score": severity,
-                "groq_description": description or str(full_result.get("groq_summary", "")),
+                "gemini_description": description or str(full_result.get("gemini_reasoning", "")),
                 "authority_alerted": [],
                 "vehicle_plates": [],
                 "screenshot": screenshot,
@@ -347,10 +400,10 @@ def handle_groq_threat(threat: dict[str, Any], frame: Any, full_result: dict[str
             "camera_latitude": lat,
             "camera_longitude": lon,
             "description": description,
-            "groq_description": description or str(full_result.get("groq_summary", "")),
+            "gemini_description": description or str(full_result.get("gemini_reasoning", "")),
             "action": action,
             "recommended_action": action,
-            "detected_by": "Groq Vision AI",
+            "detected_by": "Gemini 2.5 Flash",
             "nearby_authorities": nearby,
             "screenshot": screenshot,
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -358,15 +411,15 @@ def handle_groq_threat(threat: dict[str, Any], frame: Any, full_result: dict[str
 
         threading.Thread(target=send_all_alerts, args=(incident, screenshot), daemon=True).start()
     except Exception as e:
-        _log(f"groq-threat {e}")
+        _log(f"gemini-threat {e}")
 
 
-def youtube_groq_loop() -> None:
-    global groq_yt_running
-    global latest_groq_result
+def youtube_gemini_loop() -> None:
+    global gemini_yt_running
+    global latest_gemini_result
 
-    _runtime["youtube_groq_loop_running"] = True
-    _log("YouTube Groq Vision loop started")
+    _runtime["youtube_gemini_loop_running"] = True
+    _log("YouTube Gemini Vision loop started")
     while True:
         try:
             if _camera.source_type != "youtube":
@@ -384,9 +437,9 @@ def youtube_groq_loop() -> None:
                 continue
 
             should_run = False
-            with groq_yt_lock:
-                if not groq_yt_running:
-                    groq_yt_running = True
+            with gemini_yt_lock:
+                if not gemini_yt_running:
+                    gemini_yt_running = True
                     should_run = True
 
             if not should_run:
@@ -395,31 +448,31 @@ def youtube_groq_loop() -> None:
 
             result = _detector.analyze_youtube_frame(frame)
 
-            with groq_yt_lock:
-                groq_yt_running = False
+            with gemini_yt_lock:
+                gemini_yt_running = False
 
             if result is None:
-                time.sleep(3)
+                time.sleep(5)
                 continue
 
-            with groq_yt_lock:
-                latest_groq_result = result
+            with gemini_yt_lock:
+                latest_gemini_result = result
 
-            socketio.emit("groq_analysis", result)
+            socketio.emit("gemini_analysis", result)
 
             threats = result.get("threats", [])
             for threat in threats:
                 severity = float(threat.get("severity", 0) or 0)
                 confidence = float(threat.get("confidence", 0) or 0)
                 if severity >= 6 and confidence >= 0.65:
-                    handle_groq_threat(threat, frame, result)
+                    handle_gemini_threat(threat, frame, result)
 
-            time.sleep(3)
+            time.sleep(5)
         except Exception as e:
-            _log(f"groq-yt-loop {e}")
-            with groq_yt_lock:
-                groq_yt_running = False
-            time.sleep(3)
+            _log(f"gemini-yt-loop {e}")
+            with gemini_yt_lock:
+                gemini_yt_running = False
+            time.sleep(5)
 
 
 def feature_update_loop() -> None:
@@ -445,8 +498,8 @@ def ensure_background_tasks() -> None:
         socketio.start_background_task(detection_loop)
     if not _runtime["feature_loop_running"]:
         socketio.start_background_task(feature_update_loop)
-    if not _runtime["youtube_groq_loop_running"]:
-        socketio.start_background_task(youtube_groq_loop)
+    if not _runtime["youtube_gemini_loop_running"]:
+        socketio.start_background_task(youtube_gemini_loop)
 
 
 @socketio.on("connect")
@@ -523,17 +576,19 @@ def switch_camera_source():
         success = _camera.switch_source(source_type, **kwargs)
         if not success:
             socketio.emit("camera_status", {"status": "disconnected", "camera_name": "Camera", "source_type": source_type})
-            return err("Failed to switch camera source", 500)
+            detailed = _camera.get_last_error() or "Failed to switch camera source"
+            status_code = 400 if source_type == "youtube" else 500
+            return err(detailed, status_code)
 
         _detector.reset_state_on_source_change()
-        global latest_groq_result
-        with groq_yt_lock:
-            latest_groq_result = None
+        global latest_gemini_result
+        with gemini_yt_lock:
+            latest_gemini_result = None
 
-        if hasattr(handle_groq_threat, "_cooldowns"):
-            handle_groq_threat._cooldowns = {}
+        if hasattr(handle_gemini_threat, "_cooldowns"):
+            handle_gemini_threat._cooldowns = {}
 
-        socketio.emit("groq_reset", {})
+        socketio.emit("gemini_reset", {})
         socketio.emit("camera_status", {"status": "connected", "camera_name": kwargs.get("camera_name", "Camera"), "source_type": source_type})
         return ok({"message": "Camera source switched", "status": _camera.get_status(), "active_location": _active_location})
     except Exception as exc:
@@ -723,8 +778,12 @@ def set_location():
 @app.route("/api/location/search-authorities", methods=["POST"])
 def search_authorities():
     try:
-        loc = getattr(_camera, "location", {}) or {}
-        if not loc:
+        loc = {
+            "full_address": str(_active_location.get("full_address") or _active_location.get("location_name") or ""),
+            "city": str(_active_location.get("city") or ""),
+            "state": str(_active_location.get("state") or ""),
+        }
+        if not loc["full_address"]:
             return jsonify({"error": "No location set"}), 400
 
         def _search() -> None:
@@ -732,6 +791,8 @@ def search_authorities():
                 loc.get("full_address", ""),
                 loc.get("city", ""),
                 loc.get("state", ""),
+                _safe_float(_active_location.get("latitude", 0.0)),
+                _safe_float(_active_location.get("longitude", 0.0)),
             )
             socketio.emit("tavily_authorities", result)
 
@@ -761,11 +822,55 @@ def get_location_authorities():
 
         # No fresh cache — kick off background search and return searching flag
         def _search() -> None:
-            result = _alert_system.search_major_authorities_tavily(loc_name, city_val, state_val)
+            result = _alert_system.search_major_authorities_tavily(
+                loc_name,
+                city_val,
+                state_val,
+                _safe_float(_active_location.get("latitude", 0.0)),
+                _safe_float(_active_location.get("longitude", 0.0)),
+            )
             socketio.emit("tavily_authorities", result)
 
         threading.Thread(target=_search, daemon=True).start()
         return ok({"hospital": [], "police": [], "searching": True})
+    except Exception as exc:
+        return err(str(exc), 500)
+
+
+@app.get("/api/alerts/pending-popups")
+def get_pending_popups():
+    try:
+        return ok(list(getattr(_alert_system, "pending_popups", []) or []))
+    except Exception as exc:
+        return err(str(exc), 500)
+
+
+@app.post("/api/voice/emergency")
+def voice_emergency():
+    """Generate an emergency voice alert mp3 using gTTS for browser fallback playback."""
+    try:
+        body = request.get_json(silent=True) or {}
+        text = str(body.get("text", "")).strip()
+        if not text:
+            return err("text is required", 400)
+
+        try:
+            from gtts import gTTS
+        except Exception as exc:
+            return err(f"gTTS unavailable: {exc}", 500)
+
+        mp3_buffer = io.BytesIO()
+        gTTS(text=text, lang="en", slow=False).write_to_fp(mp3_buffer)
+        mp3_buffer.seek(0)
+
+        return Response(
+            mp3_buffer.getvalue(),
+            mimetype="audio/mpeg",
+            headers={
+                "Content-Disposition": 'inline; filename="emergency-voice-alert.mp3"',
+                "Cache-Control": "no-store",
+            },
+        )
     except Exception as exc:
         return err(str(exc), 500)
 
@@ -1198,6 +1303,7 @@ def settings_contacts_post():
                 return err(f"Missing field: {key}", 400)
         row = _db.save_contact(body)
         _alert_system.reload_contacts()
+        _detector.reload_registered_contacts()
         if row is None:
             return err("Failed to save contact", 500)
         return ok(row, 201)
@@ -1212,6 +1318,7 @@ def settings_contacts_put(contact_id: str):
         body["id"] = contact_id
         row = _db.save_contact(body)
         _alert_system.reload_contacts()
+        _detector.reload_registered_contacts()
         if row is None:
             return err("Failed to update contact", 500)
         return ok(row)
@@ -1224,6 +1331,7 @@ def settings_contacts_delete(contact_id: str):
     try:
         success = _db.delete_contact(contact_id)
         _alert_system.reload_contacts()
+        _detector.reload_registered_contacts()
         if not success:
             return err("Contact not found", 404)
         return ok({"deleted": True})
@@ -1293,7 +1401,10 @@ def _detect_webcam_location() -> dict[str, Any] | None:
 
 
 def initialize_runtime() -> None:
-    _log("initializing runtime modules")
+    _log("initializing Protego runtime...")
+    
+    # Start Telegram polling listener
+    threading.Thread(target=_telegram_polling_thread, daemon=True).start()
 
     # Load heavy models in background so server accepts connections immediately.
     def _model_loader():
@@ -1303,9 +1414,11 @@ def initialize_runtime() -> None:
 
     ensure_background_tasks()
 
-    # Start default source: webcam index 0.
-    socketio.emit("camera_status", {"status": "connecting", "camera_name": "Laptop Webcam", "source_type": "webcam"})
-    started = _camera.start("webcam", index=0, camera_name="Laptop Webcam")
+    # NO AUTO-START: Webcam will start only when user clicks "Start Webcam" button
+    # This reduces unnecessary frame analysis and Gemini API calls on startup
+    _log("runtime initialized; waiting for manual camera start")
+    
+    # Set initial location for when webcam is eventually started
     auto_loc = _detect_webcam_location()
     if auto_loc:
         _set_active_location(
@@ -1317,10 +1430,48 @@ def initialize_runtime() -> None:
         )
     else:
         _set_active_location("Unknown", 0.0, 0.0, "auto", "webcam")
-    if started:
-        _log("default webcam started")
-    else:
-        _log("default webcam failed to start")
+
+
+@app.post("/api/alerts/register-session")
+def alerts_register_session():
+    """Register judge contact info for current session."""
+    try:
+        body = request.get_json(silent=True) or {}
+        email = body.get("email")
+        phone = body.get("phone")
+        
+        _alert_system.register_session_contact(email=email, phone=phone)
+        return ok({"status": "registered", "email": email, "phone": phone})
+    except Exception as exc:
+        return err(str(exc), 500)
+
+
+@app.get("/api/telegram/status")
+def telegram_status():
+    """Check current Telegram registration status."""
+    return ok({
+        "is_connected": bool(_alert_system.session_telegram_chat_id),
+        "chat_id": _alert_system.session_telegram_chat_id,
+        "registration_code": _alert_system.session_telegram_code
+    })
+
+
+@app.post("/api/telegram/request-code")
+def telegram_request_code():
+    """Generate a new unique code for /start registration."""
+    code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
+    _alert_system.session_telegram_code = code
+    
+    bot_username = os.getenv("TELEGRAM_BOT_USERNAME")
+    if not bot_username and _alert_system.telegram_token:
+        try:
+            resp = requests.get(f"https://api.telegram.org/bot{_alert_system.telegram_token}/getMe", timeout=5)
+            if resp.status_code == 200:
+                bot_username = resp.json().get("result", {}).get("username")
+        except Exception:
+            pass
+            
+    return ok({"code": code, "bot_username": bot_username or "ProtegoSafetyBot"})
 
 
 @app.get("/api/health")
@@ -1354,7 +1505,7 @@ def test_alert():
             "location": _active_location.get("location_name", "Unknown Location"),
             "camera_latitude": _active_location.get("latitude", 0.0),
             "camera_longitude": _active_location.get("longitude", 0.0),
-            "groq_description": "This is a test alert to verify email notification system is working correctly.",
+            "gemini_description": "This is a test alert to verify email notification system is working correctly.",
             "timestamp": _utc_now(),
             "screenshot": None,
         }
@@ -1456,7 +1607,7 @@ def video_analyze():
                         if frame.shape[0] != 720 or frame.shape[1] != 1280:
                             frame = cv2.resize(frame, (1280, 720))
 
-                        # Process frame with same local + Groq-integrated live pipeline.
+                        # Process frame with same local + Gemini-integrated live pipeline.
                         results = _detector.process_frame(frame)
                         if not isinstance(results, dict):
                             continue
@@ -1466,8 +1617,8 @@ def video_analyze():
 
                         # Collect per-feature status hits for all 8 features.
                         features_status = results.get("features_status", []) or []
-                        groq_analysis = results.get("groq_analysis") or {}
-                        groq_summary = str(groq_analysis.get("groq_summary") or groq_analysis.get("scene") or "").strip()
+                        gemini_analysis = results.get("gemini_analysis") or {}
+                        gemini_summary = str(gemini_analysis.get("gemini_summary") or gemini_analysis.get("scene") or "").strip()
                         for feature in features_status:
                             feature_id = feature.get("feature_id")
                             if not feature_id:
@@ -1487,7 +1638,7 @@ def video_analyze():
                                 if timestamp - last_ts >= 2.0:
                                     feature_name = str(feature.get("feature_name") or feature_id)
                                     desc = (
-                                        groq_summary
+                                        gemini_summary
                                         or f"{feature_name} pattern detected by local models at confidence {confidence:.2f}."
                                     )
                                     incidents.append({
@@ -1499,20 +1650,20 @@ def video_analyze():
                                         "incident_type": feature_name,
                                         "severity_score": int(max(1, min(10, round(confidence * 10)))),
                                         "confidence": confidence,
-                                        "groq_description": desc,
+                                        "gemini_description": desc,
                                         "threat_level": "high" if confidence >= 0.8 else "medium",
                                         "screenshot": screenshot_b64,
                                     })
                                     feature_incident_cooldown[feature_id] = timestamp
 
-                        # If low-confidence local detections or any flags exist, run Groq confirmation path.
+                        # If low-confidence local detections or any flags exist, run Gemini confirmation path.
                         all_detections = results.get("detections", []) or []
                         has_low_conf = any(float(d.get("confidence", 1.0) or 1.0) < 0.70 for d in all_detections)
                         detector_alerts = results.get("alerts", []) or []
                         if has_low_conf or detector_alerts:
                             top_conf = max([float(d.get("confidence", 0.0) or 0.0) for d in all_detections], default=0.5)
                             try:
-                                _detector.confirm_with_groq(
+                                _detector.confirm_with_gemini(
                                     frame,
                                     context_description=(
                                         f"Video-analyzer frame review at {timestamp}s. "
@@ -1534,27 +1685,27 @@ def video_analyze():
                                 "incident_type": alert.get("incident_type", alert.get("feature_name", "Unknown Incident")),
                                 "severity_score": int(alert.get("severity_score", max(1, min(10, round(float(alert.get("confidence", 0.7) or 0.7) * 10))))),
                                 "confidence": float(alert.get("confidence", 0.0) or 0.0),
-                                "groq_description": alert.get("groq_description") or alert.get("description") or "No description available",
+                                "gemini_description": alert.get("gemini_description") or alert.get("description") or "No description available",
                                 "threat_level": alert.get("threat_level", "medium"),
                                 "screenshot": screenshot_b64,
                             })
 
-                        # Include Groq-pending alerts generated by live pipeline thread.
-                        groq_alerts = results.get("groq_alerts", []) or []
-                        for g_alert in groq_alerts:
+                        # Include Gemini-pending alerts generated by live pipeline thread.
+                        gemini_alerts = results.get("gemini_alerts", []) or []
+                        for g_alert in gemini_alerts:
                             shot = str(g_alert.get("screenshot") or "")
                             if shot and not shot.startswith("data:image"):
                                 shot = "data:image/jpeg;base64," + shot
                             incidents.append({
-                                "id": g_alert.get("id", f"vid-groq-{video_id}-{frame_count}-{len(incidents)}"),
+                                "id": g_alert.get("id", f"vid-gemini-{video_id}-{frame_count}-{len(incidents)}"),
                                 "timestamp": timestamp,
                                 "frame_number": frame_count,
-                                "feature_id": g_alert.get("feature_id", "groq-vision"),
-                                "feature_name": g_alert.get("feature_name", g_alert.get("incident_type", "Groq Vision Incident")),
-                                "incident_type": g_alert.get("incident_type", "Groq Vision Incident"),
+                                "feature_id": g_alert.get("feature_id", "gemini-vision"),
+                                "feature_name": g_alert.get("feature_name", g_alert.get("incident_type", "Gemini Vision Incident")),
+                                "incident_type": g_alert.get("incident_type", "Gemini Vision Incident"),
                                 "severity_score": int(g_alert.get("severity_score", 7) or 7),
                                 "confidence": float(g_alert.get("confidence", 0.0) or 0.0),
-                                "groq_description": g_alert.get("groq_description") or "No description available",
+                                "gemini_description": g_alert.get("gemini_description") or "No description available",
                                 "threat_level": g_alert.get("threat_level", "high"),
                                 "screenshot": shot or screenshot_b64,
                             })

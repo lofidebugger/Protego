@@ -25,8 +25,15 @@ dist-ssr
 
 .config/
 
+
+node_modules/
 .env
 venv/
-__pycache__/
+.venv/
+backend/venv/
+backend/.venv/
+pycache/
 *.pyc
-node_modules/
+*.pyo
+*.pyd
+*.pt

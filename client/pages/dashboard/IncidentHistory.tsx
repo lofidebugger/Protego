@@ -54,7 +54,7 @@ interface Incident {
   camera_name: string;
   timestamp: string;
   severity_score: number;
-  groq_description: string;
+  gemini_description: string;
   vehicle_plates: string[];
   authority_alerted: string[];
   screenshot: string;
@@ -505,9 +505,9 @@ export default function IncidentHistory() {
                 )}
 
                 <div className="space-y-4">
-                  <h4 className="text-[9px] font-black text-white/30 uppercase tracking-[0.4em]">Groq Vision Synopsis</h4>
+                  <h4 className="text-[9px] font-black text-white/30 uppercase tracking-[0.4em]">Gemini Vision Analysis</h4>
                   <p className="text-white/70 text-sm leading-loose font-medium bg-white/[0.02] p-6 rounded-3xl border border-white/[0.04]">
-                    "{selectedIncident.groq_description}"
+                    "{selectedIncident.gemini_description}"
                   </p>
                 </div>
 

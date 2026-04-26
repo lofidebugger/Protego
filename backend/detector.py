@@ -38,9 +38,9 @@ except Exception:  # pragma: no cover
     DeepFace = None
 
 try:
-    from groq import Groq
+    import google.generativeai as genai
 except Exception:  # pragma: no cover
-    Groq = None
+    genai = None
 
 from concurrent.futures import ThreadPoolExecutor
 
@@ -108,28 +108,33 @@ class Detector:
         self.ocr_reader = None
         self.deepface_enabled = False
         self.tracker = None
-        self.groq_client = None
+        self.gemini_client = None
         # Vision-capable model required for image+text content payloads.
-        self.groq_model = "meta-llama/llama-4-scout-17b-16e-instruct"
+        self.gemini_model_name = "gemini-2.5-flash"
         self.anpr = ANPRReader()
         self.plate_regex = re.compile(r"^[A-Z]{2}[0-9]{2}[A-Z]{1,2}[0-9]{4}$")
 
-        # Groq rate-limiting: track last call time per feature key.
-        self._groq_last_call: dict[str, float] = {}
-        self._groq_cooldown = 10.0  # seconds between Groq calls per feature
+        # Gemini rate-limiting: track last call time per feature key.
+        self._gemini_last_call: dict[str, float] = {}
+        self._gemini_cooldown = 10.0  # seconds between Gemini calls per feature
         self._alert_times: dict[str, float] = {}
-        self.groq_last_time = 0.0
-        self.groq_interval = 4.0
-        self.groq_latest_result: dict[str, Any] | None = None
-        self.groq_running = False
-        # YouTube-only Groq rate-limit guard to avoid repeated 429 calls.
-        self.youtube_groq_retry_until = 0.0
-        self.youtube_groq_last_rl_log = 0.0
-        self._groq_pending_alerts: list[dict[str, Any]] = []
-        self._groq_alert_times: dict[str, float] = {}
+        self.gemini_last_time = 0.0
+        self.gemini_interval = 5.0  # Send frames to Gemini every 5 seconds (max 12 req/min, leaves headroom on free tier 10 req/min)
+        self.gemini_interval_webcam = 5.0  # Webcam also uses 5-second cadence as requested
+        self.gemini_latest_result: dict[str, Any] | None = None
+        self.gemini_running = False
+        self.gemini_retry_until = 0.0
+        self.gemini_last_rl_log = 0.0  # Log rate limit messages only every 30 seconds to avoid spam
+        # YouTube-only Gemini rate-limit guard to avoid repeated 429 calls.
+        self.youtube_gemini_retry_until = 0.0
+        self.youtube_gemini_last_rl_log = 0.0
+        self._gemini_pending_alerts: list[dict[str, Any]] = []
+        self._gemini_alert_times: dict[str, float] = {}
+        self.registered_contacts: list[dict[str, Any]] = []
+        self.gemini_quota_exhausted = False  # NEW: Global fallback flag for hackathon reliability
 
         # False Positive Learning
-        self.groq_rejections: dict[str, list[float]] = defaultdict(list)
+        self.gemini_rejections: dict[str, list[float]] = defaultdict(list)
         self.feature_threshold_penalties: dict[str, float] = defaultdict(float)
 
         self.state_lock = Lock()
@@ -161,6 +166,50 @@ class Detector:
                 "frames_processed": 0,
                 "crowd_density": 0.0 if feature_id == "feat-4" else None,
             }
+
+        self.reload_registered_contacts()
+
+    def register_contact(self, name: str, email: str, phone: str) -> None:
+        contact = {
+            "name": str(name or "").strip(),
+            "email": str(email or "").strip(),
+            "phone": str(phone or "").strip(),
+        }
+        if not contact["email"]:
+            return
+
+        self.registered_contacts = [row for row in self.registered_contacts if str(row.get("email", "")).strip().lower() != contact["email"].lower()]
+        self.registered_contacts.append(contact)
+
+    def get_registered_contacts(self) -> list[dict[str, Any]]:
+        return [dict(row) for row in self.registered_contacts]
+
+    def remove_contact(self, email: str) -> None:
+        target = str(email or "").strip().lower()
+        if not target:
+            return
+        self.registered_contacts = [row for row in self.registered_contacts if str(row.get("email", "")).strip().lower() != target]
+
+    def reload_registered_contacts(self) -> None:
+        self.registered_contacts = []
+        if self.settings_provider is None:
+            return
+        try:
+            contacts = self.settings_provider.get_contacts() or []
+        except Exception:
+            contacts = []
+
+        for row in contacts:
+            email = str(row.get("email", "")).strip()
+            if not email:
+                continue
+            self.registered_contacts.append(
+                {
+                    "name": str(row.get("name", "")).strip(),
+                    "email": email,
+                    "phone": str(row.get("whatsapp_number") or row.get("phone") or "").strip(),
+                }
+            )
 
     def load_models(self) -> None:
         """Load all heavy models. Call this from a background thread."""
@@ -245,15 +294,16 @@ class Detector:
             except Exception as exc:
                 self._log(f"DeepSort init failed: {exc}")
 
-        # 6. Groq client
+        # 6. Gemini client
         self.deepface_enabled = DeepFace is not None
-        groq_key = os.getenv("GROQ_API_KEY", "").strip()
-        if Groq is not None and groq_key:
+        gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+        if genai is not None and gemini_key:
             try:
-                self.groq_client = Groq(api_key=groq_key)
-                self._log("Groq client initialized")
+                genai.configure(api_key=gemini_key)
+                self.gemini_client = genai.GenerativeModel(self.gemini_model_name)
+                self._log(f"Gemini client initialized with {self.gemini_model_name}")
             except Exception as exc:
-                self._log(f"groq init failed: {exc}")
+                self._log(f"gemini init failed: {exc}")
 
         self.models_loaded = True
         self._log("all models loaded — detection ready")
@@ -397,20 +447,20 @@ class Detector:
         draw_items.extend(feature_boxes)
         self.draw_detections(annotated, draw_items)
 
-        self.analyze_with_groq(frame)
+        self.analyze_with_gemini(frame, source_type=source_type)
 
         with self.state_lock:
-            groq_analysis = dict(self.groq_latest_result) if self.groq_latest_result else None
-            groq_alerts = list(self._groq_pending_alerts)
-            self._groq_pending_alerts.clear()
+            gemini_analysis = dict(self.gemini_latest_result) if self.gemini_latest_result else None
+            gemini_alerts = list(self._gemini_pending_alerts)
+            self._gemini_pending_alerts.clear()
 
         elapsed = max(0.001, time.time() - start)
         return {
             "annotated_frame": annotated,
             "detections": general_detections + fire_detections,
             "alerts": alerts,
-            "groq_analysis": groq_analysis,
-            "groq_alerts": groq_alerts,
+            "gemini_analysis": gemini_analysis,
+            "gemini_alerts": gemini_alerts,
             "features_status": self.get_features_status(),
             "processing_fps": round(1.0 / elapsed, 2),
         }
@@ -661,47 +711,135 @@ class Detector:
 
         return 180.0
 
+    def _parse_gemini_retry_seconds(self, error_text: str) -> float:
+        """Extract retry hint from Gemini 429 payloads."""
+        if not error_text:
+            return 60.0
+
+        # Example: "Please retry in 8.94422454s"
+        sec_hint = re.search(r"retry in\s*([\d.]+)s", error_text, flags=re.IGNORECASE)
+        if sec_hint:
+            return max(5.0, float(sec_hint.group(1)) + 1.0)
+
+        # Example: "Please retry in 883.4681ms"
+        ms_hint = re.search(r"retry in\s*([\d.]+)ms", error_text, flags=re.IGNORECASE)
+        if ms_hint:
+            return max(5.0, (float(ms_hint.group(1)) / 1000.0) + 1.0)
+
+        # Example payload block: retry_delay { seconds: 8 }
+        delay_sec = re.search(r"retry_delay\s*\{[^}]*seconds:\s*(\d+)", error_text, flags=re.IGNORECASE | re.DOTALL)
+        if delay_sec:
+            return max(5.0, float(delay_sec.group(1)) + 1.0)
+
+        return 60.0
+
+    def _is_gemini_quota_error(self, error_text: str) -> bool:
+        text = (error_text or "").lower()
+        return any(token in text for token in ["429", "resource_exhausted", "quota exceeded", "rate limit"])
+
+    def _frame_to_base64_jpeg(self, frame: np.ndarray) -> str | None:
+        try:
+            ok, buf = cv2.imencode(".jpg", frame)
+            if not ok:
+                return None
+            return base64.b64encode(buf).decode("utf-8")
+        except Exception:
+            return None
+
+    def _groq_vision_prompt(self, frame: np.ndarray, prompt: str, output_hint: str = "json") -> str | None:
+        groq_key = os.getenv("GROQ_API_KEY", "").strip()
+        if not groq_key:
+            return None
+
+        try:
+            from groq import Groq
+        except Exception as exc:
+            self._log(f"groq client unavailable: {exc}")
+            return None
+
+        base64_image = self._frame_to_base64_jpeg(frame)
+        if not base64_image:
+            return None
+
+        client = Groq(api_key=groq_key)
+        response = client.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
+                ],
+            }],
+            max_tokens=1000,
+        )
+        result = response.choices[0].message.content
+        return str(result).strip() if result is not None else None
+
+    def _groq_ocr_prompt(self, plate_image: np.ndarray) -> str | None:
+        groq_key = os.getenv("GROQ_API_KEY", "").strip()
+        if not groq_key:
+            return None
+
+        try:
+            from groq import Groq
+        except Exception as exc:
+            self._log(f"groq client unavailable: {exc}")
+            return None
+
+        base64_image = self._frame_to_base64_jpeg(plate_image)
+        if not base64_image:
+            return None
+
+        prompt = (
+            "Read only the Indian vehicle number plate text from this image. "
+            "Return only one value in format XX00XX0000 without explanation."
+        )
+        client = Groq(api_key=groq_key)
+        response = client.chat.completions.create(
+            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}},
+                ],
+            }],
+            max_tokens=256,
+        )
+        result = response.choices[0].message.content
+        return str(result).strip() if result is not None else None
+
     def analyze_youtube_frame(self, frame: np.ndarray) -> dict[str, Any] | None:
         """
-        YouTube mode — Groq Vision ONLY.
+        YouTube mode — Gemini primary, Groq fallback on quota errors.
         No YOLO. No MediaPipe.
-        Just send frame to Groq and get full threat analysis back.
+        Sends frame to Gemini first; automatically falls back to Groq when Gemini is rate-limited.
         """
         try:
             now = time.time()
-            if now < self.youtube_groq_retry_until:
-                retry_after = max(1, int(self.youtube_groq_retry_until - now))
+            if self.gemini_quota_exhausted or now < self.youtube_gemini_retry_until:
+                retry_after = max(1, int(self.youtube_gemini_retry_until - now)) if not self.gemini_quota_exhausted else 0
                 # Limit console spam while in cooldown.
-                if now - self.youtube_groq_last_rl_log >= 30:
-                    print(f"[groq-yt] rate-limited, retrying in {retry_after}s")
-                    self.youtube_groq_last_rl_log = now
-                return {
-                    "scene": "Groq temporarily rate-limited; waiting before next analysis.",
-                    "safe": True,
-                    "threats": [],
-                    "timestamp": time.strftime("%H:%M:%S"),
-                    "source": "groq_vision",
-                    "rate_limited": True,
-                    "retry_after_seconds": retry_after,
-                }
+                if now - self.youtube_gemini_last_rl_log >= 30:
+                    print(f"[gemini-yt] rate-limited, retrying in {retry_after}s")
+                    self.youtube_gemini_last_rl_log = now
+                return self._groq_youtube_analysis(frame, rate_limited=True, retry_after_seconds=retry_after)
 
-            import cv2
-            import base64
-            import json
-            import os
-            from groq import Groq
+            import PIL.Image
 
-            client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+            gemini_key = os.getenv("GEMINI_API_KEY")
+            if not gemini_key:
+                return self._groq_youtube_analysis(frame, gemini_unavailable=True)
+            genai.configure(api_key=gemini_key)
+            model = genai.GenerativeModel(self.gemini_model_name)
 
             h, w = frame.shape[:2]
-            if w > 720:
-                scale = 720 / w
-                frame = cv2.resize(frame, (720, int(h * scale)))
+            if w > 1280:
+                scale = 1280 / w
+                frame = cv2.resize(frame, (1280, int(h * scale)))
 
-            ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            if not ok:
-                return None
-            b64 = base64.b64encode(buffer).decode("utf-8")
+            pil_img = PIL.Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
             prompt = """You are an experienced
 Indian security guard who has
@@ -1040,112 +1178,340 @@ IMPORTANT RULES:
 - Return only valid JSON
 """
 
-            response = client.chat.completions.create(
-                model="meta-llama/llama-4-scout-17b-16e-instruct",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": "data:image/jpeg;base64," + b64},
-                            },
-                            {
-                                "type": "text",
-                                "text": prompt,
-                            },
-                        ],
-                    }
-                ],
-                max_tokens=450,
-                temperature=0.1,
-            )
+            gemini_key = os.getenv("GEMINI_API_KEY")
+            if not gemini_key or not self.gemini_client:
+                return None
 
-            raw = (response.choices[0].message.content or "").strip()
+            h, w = frame.shape[:2]
+            if w > 1280:
+                scale = 1280 / w
+                frame = cv2.resize(frame, (1280, int(h * scale)))
 
-            if "```" in raw:
-                parts = raw.split("```")
-                if len(parts) > 1:
-                    raw = parts[1].strip()
-                    if raw.startswith("json"):
-                        raw = raw[4:].strip()
+            pil_img = PIL.Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
-            result = json.loads(raw)
+            prompt = """You are an experienced
+Indian security guard who has
+watched CCTV footage for 15 years.
+
+You have seen thousands of hours
+of normal street life - people
+walking, talking, sitting, arguing,
+vehicles moving, children playing,
+workers working. ALL of this is
+NORMAL to you. You are NOT alarmed
+by any of this.
+
+You only raise an alert when
+something makes your gut say
+"something is genuinely wrong here."
+
+Look at this frame like a human
+would. Use common sense.
+
+ASK YOURSELF:
+- Would a real person watching
+  this live be alarmed right now?
+- Is there clear visible evidence
+  of danger or is it just unusual?
+- Could this have a completely
+  normal explanation?
+- Would I call the police if I
+  saw this in real life right now?
+
+If the answer is NO to any of these
+- it is safe. Do not alert.
+
+THINGS THAT ARE ALWAYS NORMAL:
+- One person standing, walking,
+  waiting, sitting anywhere
+- Small groups of people talking
+- People on phones
+- Vehicles moving or parked
+- Children playing
+- Workers carrying things
+- People arguing verbally
+- Foggy or hazy or dark scenes
+- Empty roads or streets
+- People running casually
+- Busy crowded streets
+
+ONLY ALERT FOR THESE - AND ONLY
+WHEN YOU CAN CLEARLY SEE IT:
+
+ROAD ACCIDENT:
+DETECT ONLY if you see:
+- Vehicles visibly crashed or
+  collided with visible damage
+- Vehicle overturned or off-road
+- Person lying on road near vehicle
+- Person thrown onto road from
+  collision impact
+- Debris, glass, metal parts or
+  vehicle fragments on road
+- Smoke or sparks coming from
+  vehicle after impact
+- Two or more vehicles in contact
+  with each other abnormally
+- Vehicles stopped at abnormal
+  angles suggesting collision
+- Skid marks visible with stopped
+  vehicles nearby
+- Bystanders surrounding stopped
+  vehicles in panic formation
+
+FIRE AND SMOKE:
+DETECT ONLY if you see:
+- Visible orange or red flames
+- Thick dark or white smoke rising
+  from a clear fixed source
+- Building structure on fire
+- Electrical sparks or fire
+- Vehicle or object actively burning
+- Fire spreading across surface
+
+MEDICAL EMERGENCY:
+DETECT ONLY if you see:
+- Person completely collapsed and
+  lying motionless on ground
+- Person falling down suddenly
+- Person holding chest or head in
+  obvious severe pain
+- Bystanders performing CPR
+- Person unconscious on sidewalk
+
+PUBLIC SAFETY THREATS:
+DETECT ONLY if you see:
+- Group fight with physical contact
+  (punches, kicks, pushing)
+- Person being forcibly pulled into
+  a vehicle (abduction)
+- Person brandishing a weapon
+  (gun, knife, long stick)
+- Crowd running in panic away from
+  a specific point (stampede)
+- Person dumping large bags of
+  trash from a vehicle illegally
+
+RESPONSE FORMAT:
+You MUST respond in EXACT JSON:
+{
+    "scene": "Short description of what is happening",
+    "safe": true/false,
+    "threats": [
+        {
+            "feature": "feat-2" (for accident) OR "feat-8" (for fire) OR "feat-3" (for medical) OR "feat-1" (for fight) OR "feat-5" (for kidnap) OR "feat-6" (for dumping) OR "feat-4" (for stampede),
+            "type": "Specific threat",
+            "description": "Exactly what you see that made you alert - be specific about what is visually happening",
+            "evidence": "The specific thing in the frame that proves this is real and not normal",
+            "severity": 8,
+            "confidence": 0.88,
+            "action": "What should be done right now"
+        }
+    ],
+    "gemini_summary": "A natural paragraph as a security guard would summarize this to their supervisor"
+}
+
+IMPORTANT RULES:
+- If you are not 80% sure - safe=true
+- One person alone is NEVER suspicious
+- Only put threats you would
+    personally stake your job on
+- gemini_summary should sound like
+    a real human wrote it, not a robot
+- scene should be honest and simple
+- Return only valid JSON
+"""
+
+            response = self.gemini_client.generate_content([prompt, pil_img])
+            raw = (response.text or "").strip()
+
+            result = self._extract_json_from_text(raw)
+            if not result:
+                raise json.JSONDecodeError("Gemini JSON extraction failed", raw, 0)
 
             result["timestamp"] = time.strftime("%H:%M:%S")
-            result["source"] = "groq_vision"
+            result["source"] = "gemini_vision"
 
-            print(f"[groq-yt] {result.get('scene', '')}")
+            print(f"[gemini-yt] {result.get('scene', '')}")
 
             threats = result.get("threats", [])
             if threats:
                 for t in threats:
                     print(
-                        f"[groq-yt] alert {t.get('feature')} - {t.get('type')} "
+                        f"[gemini-yt] alert {t.get('feature')} - {t.get('type')} "
                         f"(severity {t.get('severity')}/10)"
                     )
 
             return result
 
-        except json.JSONDecodeError:
-            return {
-                "scene": "Analysis in progress...",
-                "safe": True,
-                "threats": [],
-                "timestamp": time.strftime("%H:%M:%S"),
-                "source": "groq_vision",
-            }
         except Exception as e:
             error_text = str(e)
-            if "rate_limit_exceeded" in error_text or "Error code: 429" in error_text:
-                retry_seconds = self._parse_groq_retry_seconds(error_text)
+            if self._is_gemini_quota_error(error_text):
+                retry_seconds = self._parse_gemini_retry_seconds(error_text)
                 now = time.time()
-                self.youtube_groq_retry_until = now + retry_seconds
-                self.youtube_groq_last_rl_log = now
-                print(f"[groq-yt] rate limit hit, pausing requests for {int(retry_seconds)}s")
+                self.youtube_gemini_retry_until = now + retry_seconds
+                self.youtube_gemini_last_rl_log = now
+                print(f"[gemini-yt] rate limit hit, pausing requests for {int(retry_seconds)}s")
+                return self._groq_youtube_analysis(frame, rate_limited=True, retry_after_seconds=int(retry_seconds), gemini_error=str(e))
+
+            print(f"[gemini-yt] error: {e}")
+            return None
+
+    def _groq_youtube_analysis(
+        self,
+        frame: np.ndarray,
+        rate_limited: bool = False,
+        retry_after_seconds: int = 0,
+        gemini_unavailable: bool = False,
+        gemini_error: str | None = None,
+    ) -> dict[str, Any] | None:
+        prompt = """You are an experienced
+Indian security guard who has
+watched CCTV footage for 15 years.
+
+You have seen thousands of hours
+of normal street life - people
+walking, talking, sitting, arguing,
+vehicles moving, children playing,
+workers working. ALL of this is
+NORMAL to you. You are NOT alarmed
+by any of this.
+
+You only raise an alert when
+something makes your gut say
+"something is genuinely wrong here."
+
+Look at this frame like a human
+would. Use common sense.
+
+Respond in this JSON format:
+{
+    "scene": "Short description of what is happening",
+    "safe": true/false,
+    "threats": [
+        {
+            "feature": "feat-2" (for accident) OR "feat-8" (for fire) OR "feat-3" (for medical) OR "feat-1" (for fight) OR "feat-5" (for kidnap) OR "feat-6" (for dumping) OR "feat-4" (for stampede),
+            "type": "Specific threat",
+            "description": "Exactly what you see that made you alert - be specific about what is visually happening",
+            "evidence": "The specific thing in the frame that proves this is real and not normal",
+            "severity": 8,
+            "confidence": 0.88,
+            "action": "What should be done right now"
+        }
+    ],
+    "groq_summary": "A natural paragraph as a security guard would summarize this to their supervisor"
+}
+
+IMPORTANT RULES:
+- If you are not 80% sure - safe=true
+- One person alone is NEVER suspicious
+- Only put threats you would personally stake your job on
+- Return only valid JSON
+"""
+        try:
+            raw = self._groq_vision_prompt(frame, prompt)
+            if not raw:
+                return None
+            result = self._extract_json_from_text(raw)
+            if not result:
                 return {
-                    "scene": "Groq rate limit reached; retrying shortly.",
+                    "scene": raw[:200],
                     "safe": True,
                     "threats": [],
                     "timestamp": time.strftime("%H:%M:%S"),
                     "source": "groq_vision",
-                    "rate_limited": True,
-                    "retry_after_seconds": int(retry_seconds),
+                    "fallback": True,
+                    "rate_limited": rate_limited,
+                    "retry_after_seconds": retry_after_seconds,
                 }
 
-            print(f"[groq-yt] error: {e}")
+            result["timestamp"] = time.strftime("%H:%M:%S")
+            result["source"] = "groq_vision"
+            result["fallback"] = True
+            result["rate_limited"] = rate_limited
+            if retry_after_seconds:
+                result["retry_after_seconds"] = retry_after_seconds
+            if gemini_unavailable:
+                result["gemini_unavailable"] = True
+            if gemini_error:
+                result["gemini_error"] = gemini_error
+            print("[fallback] using Groq vision - Gemini quota exceeded")
+            return result
+        except Exception as exc:
+            print(f"[groq-yt] error: {exc}")
             return None
 
-    def analyze_with_groq(self, frame: np.ndarray) -> None:
+    def analyze_with_gemini(self, frame: np.ndarray, source_type: str = "webcam") -> None:
+        """Send frame to Gemini for vision analysis at controlled intervals to stay under free tier limits.
+        
+        Rate limiting:
+        - YouTube: every 5 seconds (~12 requests/minute, under free tier 10 req/min)
+        - Webcam: every 10 seconds (~6 requests/minute, very safe)
+        - On 429 errors: backs off for returned retry-delay seconds (min 5s)
+        - During cooldown: reuses last successful Gemini result (no detection gap)
+        """
         try:
             now = time.time()
-            if now - self.groq_last_time < self.groq_interval:
+            # Check if we're in rate-limit cooldown from a 429 error
+            if self.gemini_quota_exhausted or now < self.gemini_retry_until:
+                # Rate limit in effect - use Groq fallback if quota is exhausted
+                if self.gemini_quota_exhausted:
+                    # Trigger Groq fallback immediately
+                    if not self.gemini_running:
+                        self.gemini_running = True
+                        threading.Thread(
+                            target=self._gemini_analyze_thread,
+                            args=(frame.copy(),),
+                            daemon=True,
+                        ).start()
+                    return
+
+                # Regular cooldown logic
+                if now - self.gemini_last_rl_log >= 30:
+                    retry_after = max(1, int(self.gemini_retry_until - now))
+                    self._log(f"[gemini] rate limit cooldown; retrying in {retry_after}s (reusing last result)")
+                    self.gemini_last_rl_log = now
+                return  # Reuse gemini_latest_result from last successful analysis
+            
+            # Use different intervals based on source type
+            interval = self.gemini_interval_webcam if source_type == "webcam" else self.gemini_interval
+            
+            # Check if enough time has passed since last API call
+            if now - self.gemini_last_time < interval:
+                return  # Within interval - reuse last result
+            
+            # Skip if already analyzing or no client
+            if self.gemini_running:
                 return
-            if self.groq_running:
-                return
-            if Groq is None or not os.getenv("GROQ_API_KEY", "").strip():
+            if self.gemini_client is None:
                 return
 
-            self.groq_last_time = now
-            self.groq_running = True
+            # Trigger new analysis in background thread
+            self.gemini_last_time = now
+            self.gemini_running = True
             frame_copy = frame.copy()
             threading.Thread(
-                target=self._groq_analyze_thread,
+                target=self._gemini_analyze_thread,
                 args=(frame_copy,),
                 daemon=True,
-                name="GroqVisionAnalysis",
+                name="GeminiVisionAnalysis",
             ).start()
         except Exception as exc:
-            self._log(f"groq error: {exc}")
-            self.groq_running = False
+            self._log(f"gemini error: {exc}")
+            self.gemini_running = False
 
-    def _groq_analyze_thread(self, frame: np.ndarray) -> None:
+    def _gemini_analyze_thread(self, frame: np.ndarray) -> None:
         raw = ""
         try:
-            if Groq is None:
+            if self.gemini_client is None:
+                groq_result = self._groq_general_vision(frame)
+                if groq_result is not None:
+                    with self.state_lock:
+                        self.gemini_latest_result = groq_result
                 return
 
-            client = Groq(api_key=os.getenv("GROQ_API_KEY", "").strip())
+            import PIL.Image
+            import io
 
             h, w = frame.shape[:2]
             if w > 640:
@@ -1156,71 +1522,48 @@ IMPORTANT RULES:
             people_count = len([d for d in yolo_detections if d.get("category") == "person"])
             vehicles_count = len([d for d in yolo_detections if d.get("category") == "vehicle"])
 
-            ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
-            if not ok:
-                return
-            img_b64 = base64.b64encode(buffer).decode("utf-8")
+            pil_img = PIL.Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
-            response = client.chat.completions.create(
-                model="meta-llama/llama-4-scout-17b-16e-instruct",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"},
-                            },
-                            {
-                                "type": "text",
-                                "text": (
-                                    "You are Protego, an AI surveillance system for Indian public safety. "
-                                    "Analyze this CCTV frame carefully and respond in exact JSON with keys: "
-                                    "scene, people_count, vehicles_count, threats, safe. "
-                                    "Each threat must contain type, description, severity, confidence, action. "
-                                    "Check specifically for road accidents, collapsed persons, fire or smoke, fights, robbery, "
-                                    "loitering, crowd panic, forced abduction, illegal dumping, reckless driving, weapons, and any other public safety threat. "
-                                    "If safe, set safe=true and threats=[]. Return only valid JSON."
-                                ),
-                            },
-                        ],
-                    }
-                ],
-                max_tokens=600,
-                temperature=0.1,
+            prompt = (
+                "You are Protego, an AI surveillance system for Indian public safety. "
+                "Analyze this CCTV frame carefully and respond in exact JSON with keys: "
+                "scene, people_count, vehicles_count, threats, safe. "
+                "Each threat must contain type, description, severity, confidence, action. "
+                "Check specifically for road accidents, collapsed persons, fire or smoke, fights, robbery, "
+                "loitering, crowd panic, forced abduction, illegal dumping, reckless driving, weapons, and any other public safety threat. "
+                "If safe, set safe=true and threats=[]. Return only valid JSON."
             )
 
-            raw = (response.choices[0].message.content or "").strip()
-            if "```" in raw:
-                for part in raw.split("```"):
-                    chunk = part.strip()
-                    if chunk.startswith("json"):
-                        chunk = chunk[4:].strip()
-                    if chunk.startswith("{"):
-                        raw = chunk
-                        break
+            response = self.gemini_client.generate_content([prompt, pil_img])
 
-            result = json.loads(raw)
-            result["timestamp"] = time.strftime("%H:%M:%S")
-            result.setdefault("scene", "Scene analysis unavailable")
-            result.setdefault("people_count", people_count)
-            result.setdefault("vehicles_count", vehicles_count)
-            result.setdefault("threats", [])
+            raw = (response.text or "").strip()
+
+            result = self._extract_json_from_text(raw)
+            if not result:
+                raise json.JSONDecodeError("Gemini JSON extraction failed", raw, 0)
+
+            # Capture reasoning/thinking if available (Gemini 2.5 feature)
+            if hasattr(response, "candidates") and response.candidates:
+                thought = getattr(response.candidates[0], "thought", None)
+                if thought:
+                    result["gemini_reasoning"] = thought
+
             result.setdefault("safe", not bool(result.get("threats")))
 
             with self.state_lock:
-                self.groq_latest_result = result
+                self.gemini_latest_result = result
 
-            self._log(f"[groq-vision] {result.get('scene', '')}")
+            self._log(f"[gemini-vision] {result.get('scene', '')}")
             for threat in result.get("threats", []) or []:
                 self._log(
-                    f"[groq-vision] threat: {threat.get('type', 'unknown')} - {threat.get('description', '')}"
+                    f"[gemini-vision] threat: {threat.get('type', 'unknown')} - {threat.get('description', '')}"
                 )
                 if int(threat.get("severity", 0) or 0) >= 6:
-                    self._handle_groq_alert(threat, frame)
+                    self._handle_gemini_alert(threat, frame)
         except json.JSONDecodeError as exc:
+            # Store safe fallback result when JSON parsing fails
             fallback = {
-                "scene": (raw or "Groq returned unparsable output")[:200],
+                "scene": (raw or "Gemini returned unparsable output")[:200],
                 "people_count": 0,
                 "vehicles_count": 0,
                 "threats": [],
@@ -1228,33 +1571,110 @@ IMPORTANT RULES:
                 "timestamp": time.strftime("%H:%M:%S"),
             }
             with self.state_lock:
-                self.groq_latest_result = fallback
-            self._log(f"groq JSON parse error: {exc}")
+                self.gemini_latest_result = fallback
+            self._log(f"gemini JSON parse error: {exc}")
         except Exception as exc:
-            self._log(f"groq thread error: {exc}")
+            error_text = str(exc)
+            if self._is_gemini_quota_error(error_text):
+                # Rate limit hit - implement backoff cooldown
+                self.gemini_quota_exhausted = True  # Permanently switch to Groq for this session
+                now = time.time()
+                retry_seconds = self._parse_gemini_retry_seconds(error_text)
+                self.gemini_retry_until = now + retry_seconds
+                
+                # Store safe fallback during rate limit to maintain results
+                fallback = {
+                    "scene": "Gemini rate limited - using previous analysis",
+                    "people_count": 0,
+                    "vehicles_count": 0,
+                    "threats": [],
+                    "safe": True,
+                    "timestamp": time.strftime("%H:%M:%S"),
+                }
+                with self.state_lock:
+                    if not self.gemini_latest_result:
+                        self.gemini_latest_result = fallback
+                
+                if now - self.gemini_last_rl_log >= 30:
+                    self._log(f"[gemini] 429 Rate Limit: backing off for {int(retry_seconds)}s")
+                    self.gemini_last_rl_log = now
+                groq_result = self._groq_general_vision(frame, rate_limited=True, retry_after_seconds=int(retry_seconds))
+                if groq_result is not None:
+                    with self.state_lock:
+                        self.gemini_latest_result = groq_result
+            else:
+                self._log(f"[gemini] thread error: {exc}")
         finally:
-            self.groq_running = False
+            self.gemini_running = False
 
-    def _handle_groq_alert(self, threat: dict[str, Any], frame: np.ndarray) -> None:
+    def _groq_general_vision(
+        self,
+        frame: np.ndarray,
+        rate_limited: bool = False,
+        retry_after_seconds: int = 0,
+    ) -> dict[str, Any] | None:
+        prompt = (
+            "You are Protego, an AI surveillance system for Indian public safety. "
+            "Analyze this CCTV frame carefully and respond in exact JSON with keys: "
+            "scene, people_count, vehicles_count, threats, safe. "
+            "Each threat must contain type, description, severity, confidence, action. "
+            "Check specifically for road accidents, collapsed persons, fire or smoke, fights, robbery, "
+            "loitering, crowd panic, forced abduction, illegal dumping, reckless driving, weapons, and any other public safety threat. "
+            "If safe, set safe=true and threats=[]. Return only valid JSON."
+        )
+        try:
+            raw = self._groq_vision_prompt(frame, prompt)
+            if not raw:
+                return None
+
+            result = self._extract_json_from_text(raw)
+            if not result:
+                return {
+                    "scene": raw[:200],
+                    "people_count": 0,
+                    "vehicles_count": 0,
+                    "threats": [],
+                    "safe": True,
+                    "timestamp": time.strftime("%H:%M:%S"),
+                    "source": "groq_vision",
+                    "fallback": True,
+                    "rate_limited": rate_limited,
+                    "retry_after_seconds": retry_after_seconds,
+                }
+
+            result.setdefault("safe", not bool(result.get("threats")))
+            result["timestamp"] = time.strftime("%H:%M:%S")
+            result["source"] = "groq_vision"
+            result["fallback"] = True
+            result["rate_limited"] = rate_limited
+            if retry_after_seconds:
+                result["retry_after_seconds"] = retry_after_seconds
+            print("[fallback] using Groq vision - Gemini quota exceeded")
+            return result
+        except Exception as exc:
+            self._log(f"groq general vision failed: {exc}")
+            return None
+
+    def _handle_gemini_alert(self, threat: dict[str, Any], frame: np.ndarray) -> None:
         try:
             threat_type = str(threat.get("type") or "Unknown Threat")
             severity = int(threat.get("severity", 7) or 7)
             now = time.time()
-            last = self._groq_alert_times.get(threat_type, 0.0)
+            last = self._gemini_alert_times.get(threat_type, 0.0)
             if now - last < 300:
                 return
-            self._groq_alert_times[threat_type] = now
+            self._gemini_alert_times[threat_type] = now
 
             ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
             screenshot = base64.b64encode(buf).decode("utf-8") if ok else ""
             alert_payload = {
-                "id": f"groq-{int(now * 1000)}",
-                "feature_id": "groq-vision",
-                "feature_name": "Groq Vision AI",
+                "id": f"gemini-{int(now * 1000)}",
+                "feature_id": "gemini-vision",
+                "feature_name": "Gemini Vision AI",
                 "incident_type": threat_type,
                 "severity_score": severity,
                 "confidence": float(threat.get("confidence", 0.8) or 0.8),
-                "groq_description": str(threat.get("description") or "Threat detected by Groq Vision AI"),
+                "gemini_description": str(threat.get("description") or "Threat detected by Gemini Vision AI"),
                 "recommended_action": str(threat.get("action") or "Investigate immediately"),
                 "location": "Unknown Location",
                 "authority_alerted": [],
@@ -1265,15 +1685,15 @@ IMPORTANT RULES:
                 },
                 "screenshot": screenshot,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
-                "detected_by": "Groq Vision AI",
+                "detected_by": "Gemini Vision AI",
             }
 
             with self.state_lock:
-                self._groq_pending_alerts.append(alert_payload)
+                self._gemini_pending_alerts.append(alert_payload)
 
-            self._log(f"[groq-vision] alert firing: {threat_type} severity {severity}/10")
+            self._log(f"[gemini-vision] alert firing: {threat_type} severity {severity}/10")
         except Exception as exc:
-            self._log(f"groq alert error: {exc}")
+            self._log(f"gemini alert error: {exc}")
 
     def _plate_read_for_vehicles(self, frame: np.ndarray, vehicles: list[dict[str, Any]], location: str = "unknown") -> list[str]:
         plates = []
@@ -1454,13 +1874,13 @@ IMPORTANT RULES:
             return status_result
 
         # Groq required for high-sensitivity feature
-        groq = self.confirm_with_groq(
+        gemini = self.confirm_with_gemini(
             frame,
             f"Possible distress/assault: {'; '.join(reasons)}. {n_people} people, {duration_s}s, {day_night}.",
             local_confidence=confidence,
             feature_key="feat-1",
         )
-        if groq is None or not groq.get("confirmed", True):
+        if gemini is None or not gemini.get("confirmed", True):
             state["consecutive_frames"] = 0
             return status_result
 
@@ -1474,12 +1894,12 @@ IMPORTANT RULES:
                 "feature_id": "feat-1",
                 "feature_name": "Distress & Assault Detection",
                 "incident_type": "Distress & Assault Detection",
-                "severity_score": groq.get("severity_score", max(7, int(confidence * 10))),
-                "groq_description": groq.get("description",
+                "severity_score": gemini.get("severity_score", max(7, int(confidence * 10))),
+                "gemini_description": gemini.get("description",
                     f"{n_people} people involved. Signs: {'; '.join(reasons)}. "
                     f"Duration: {duration_s}s. Detected at {day_night}. "
                     f"Local confidence: {confidence:.2f}."),
-                "threat_level": groq.get("threat_level", "high"),
+                "threat_level": gemini.get("threat_level", "high"),
                 "low_light": night_mode,
             },
         }
@@ -1536,13 +1956,13 @@ IMPORTANT RULES:
                 
                 if best_plate and best_conf >= 0.65:
                     plates.append(best_plate)
-                elif best_img is not None and self.groq_client is not None:
-                    # Send to Groq for plate reading fallback
+                elif best_img is not None and self.gemini_client is not None:
+                    # Send to Gemini for plate reading fallback
                     _, buf = cv2.imencode(".jpg", best_img)
                     b64 = base64.b64encode(buf).decode("utf-8")
                     prompt = "Read the Indian vehicle number plate text (format AA00AA0000) from this cropped image. Output exactly the text, no other words."
                     try:
-                        resp = self.groq_client.chat.completions.create(
+                        resp = self.gemini_client.chat.completions.create(
                             model="llama-3.2-11b-vision-preview",
                             messages=[{
                                 "role": "user",
@@ -1691,13 +2111,13 @@ IMPORTANT RULES:
         plates = self._read_accident_plates(frame, involved_vehicles)
         
         # Groq required for high-sensitivity feature
-        groq = self.confirm_with_groq(
+        gemini = self.confirm_with_gemini(
             frame, 
             f"Possible road accident. {'; '.join(reasons)}. Vehicle plates: {plates}.", 
             local_confidence=confidence,
             feature_key="feat-2",
         )
-        if groq is None or not groq.get("confirmed", True):
+        if gemini is None or not gemini.get("confirmed", True):
             return {"confidence": confidence, "trigger_alert": False, "boxes": []}
 
         state["alert_cooldown"] = now
@@ -1712,10 +2132,10 @@ IMPORTANT RULES:
                 "feature_id": "feat-2",
                 "feature_name": "Road Accident Detection",
                 "incident_type": "Road Accident Detection",
-                "severity_score": groq.get("severity_score", int(round(confidence * 10))),
-                "groq_description": groq.get("description", 
+                "severity_score": gemini.get("severity_score", int(round(confidence * 10))),
+                "gemini_description": gemini.get("description", 
                     f"Collision detected: {'; '.join(reasons)}. Local confidence: {confidence:.2f}."),
-                "threat_level": groq.get("threat_level", "high"),
+                "threat_level": gemini.get("threat_level", "high"),
                 "vehicle_plates": plates,
             },
         }
@@ -1813,13 +2233,13 @@ IMPORTANT RULES:
             return {"confidence": confidence, "trigger_alert": False, "boxes": []}
 
         # Groq required
-        groq = self.confirm_with_groq(
+        gemini = self.confirm_with_gemini(
             frame, 
             f"Medical emergency: {'; '.join(reasons)}", 
             local_confidence=confidence,
             feature_key="feat-3",
         )
-        if groq is None or not groq.get("confirmed", True):
+        if gemini is None or not gemini.get("confirmed", True):
             if emergency_person:
                 tid = emergency_person.get("track_id", "")
                 if tid in state["fallen"]:
@@ -1841,9 +2261,9 @@ IMPORTANT RULES:
                 "feature_id": "feat-3",
                 "feature_name": "Medical Emergency Detection",
                 "incident_type": "Medical Emergency Detection",
-                "severity_score": groq.get("severity_score", 9),
-                "groq_description": groq.get("description", "Person collapsed and motionless."),
-                "threat_level": groq.get("threat_level", "high"),
+                "severity_score": gemini.get("severity_score", 9) if gemini else 9,
+                "gemini_description": gemini.get("description", "Person collapsed and motionless.") if gemini else "Person collapsed and motionless.",
+                "threat_level": gemini.get("threat_level", "high") if gemini else "high",
             },
         }
 
@@ -1933,14 +2353,14 @@ IMPORTANT RULES:
         if speed_spike: reasons.append("sudden speed spike (panic)")
         if chaos > 0.6: reasons.append(f"high trajectory chaos ({chaos:.2f})")
 
-        # Groq confirm (optional but good)
-        groq = self.confirm_with_groq(
+        # Gemini confirm (optional but good)
+        gemini = self.confirm_with_gemini(
             frame, 
             f"Stampede {level.lower()}: {'; '.join(reasons)}", 
             local_confidence=confidence,
             feature_key="feat-4",
         )
-        if groq is not None and not groq.get("confirmed", True):
+        if gemini is not None and not gemini.get("confirmed", True):
             return {"confidence": confidence, "trigger_alert": False, "boxes": [], "crowd_density": density_val}
 
         return {
@@ -1955,9 +2375,9 @@ IMPORTANT RULES:
                 "feature_id": "feat-4",
                 "feature_name": "Stampede Prediction",
                 "incident_type": "Stampede Prediction",
-                "severity_score": groq.get("severity_score", severity) if groq else severity,
-                "groq_description": groq.get("description", f"Crowd risk {level.lower()}. {'; '.join(reasons)}."),
-                "threat_level": groq.get("threat_level", threat) if groq else threat,
+                "severity_score": gemini.get("severity_score", severity) if gemini else severity,
+                "gemini_description": gemini.get("description", f"Crowd risk {level.lower()}. {'; '.join(reasons)}.") if gemini else f"Crowd risk {level.lower()}. {'; '.join(reasons)}.",
+                "threat_level": gemini.get("threat_level", threat) if gemini else threat,
                 "crowd_density": density_val,
             },
         }
@@ -2103,8 +2523,8 @@ IMPORTANT RULES:
         plates = self._read_accident_plates(frame, near_vehicles)
         
         context = "; ".join(reasons)
-        groq = self.confirm_with_groq(frame, context, local_confidence=confidence, feature_key="feat-5")
-        if groq is None or not groq.get("confirmed", True):
+        gemini = self.confirm_with_gemini(frame, context, local_confidence=confidence, feature_key="feat-5")
+        if gemini is None or not gemini.get("confirmed", True):
             return {"confidence": confidence, "trigger_alert": False, "boxes": []}
 
         state["alert_cooldown"] = now
@@ -2116,9 +2536,9 @@ IMPORTANT RULES:
                 "feature_id": "feat-5",
                 "feature_name": "Kidnapping & Loitering",
                 "incident_type": "Kidnapping & Loitering",
-                "severity_score": groq.get("severity_score", 8 if involved_vehicles else 6),
-                "groq_description": groq.get("description", context),
-                "threat_level": "critical" if involved_vehicles else groq.get("threat_level", "high"),
+                "severity_score": gemini.get("severity_score", 8 if involved_vehicles else 6),
+                "gemini_description": gemini.get("description", context),
+                "threat_level": "critical" if involved_vehicles else gemini.get("threat_level", "high"),
                 "vehicle_plates": plates,
                 "escape_direction": escape_direction,
             },
@@ -2228,8 +2648,8 @@ IMPORTANT RULES:
             return {"confidence": confidence, "trigger_alert": False, "boxes": []}
 
         plates = self._read_accident_plates(frame, [involved_vehicle])
-        groq = self.confirm_with_groq(frame, f"Illegal dumping: {'; '.join(reasons)}", local_confidence=confidence, feature_key="feat-6")
-        if groq is None or not groq.get("confirmed", True):
+        gemini = self.confirm_with_gemini(frame, f"Illegal dumping: {'; '.join(reasons)}", local_confidence=confidence, feature_key="feat-6")
+        if gemini is None or not gemini.get("confirmed", True):
             return {"confidence": confidence, "trigger_alert": False, "boxes": []}
 
         state["alert_cooldown"] = now
@@ -2247,9 +2667,9 @@ IMPORTANT RULES:
                 "feature_id": "feat-6",
                 "feature_name": "Illegal Dumping Detection",
                 "incident_type": "Illegal Dumping Detection",
-                "severity_score": groq.get("severity_score", 7),
-                "groq_description": groq.get("description", f"Dumping sequence detected: {'; '.join(reasons)}"),
-                "threat_level": groq.get("threat_level", "high"),
+                "severity_score": gemini.get("severity_score", 7),
+                "gemini_description": gemini.get("description", f"Dumping sequence detected: {'; '.join(reasons)}"),
+                "threat_level": gemini.get("threat_level", "high"),
                 "vehicle_plates": plates,
             },
         }
@@ -2349,8 +2769,8 @@ IMPORTANT RULES:
             all_reasons.update(r_list)
         
         context = f"Reckless driving: {', '.join(all_reasons)}"
-        groq = self.confirm_with_groq(frame, context, local_confidence=confidence, feature_key="feat-7")
-        if groq is None or not groq.get("confirmed", True):
+        gemini = self.confirm_with_gemini(frame, context, local_confidence=confidence, feature_key="feat-7")
+        if gemini is None or not gemini.get("confirmed", True):
             return {"confidence": confidence, "trigger_alert": False, "boxes": []}
 
         state["alert_cooldown"] = now
@@ -2365,9 +2785,9 @@ IMPORTANT RULES:
                 "feature_id": "feat-7",
                 "feature_name": "Reckless Driving",
                 "incident_type": "Reckless Driving",
-                "severity_score": groq.get("severity_score", 8),
-                "groq_description": groq.get("description", context),
-                "threat_level": groq.get("threat_level", "high"),
+                "severity_score": gemini.get("severity_score", 8),
+                "gemini_description": gemini.get("description", context),
+                "threat_level": gemini.get("threat_level", "high"),
                 "vehicle_plates": plates,
             },
         }
@@ -2402,11 +2822,11 @@ IMPORTANT RULES:
             if not color_result.get("trigger_alert"):
                 return {"confidence": color_result["confidence"], "trigger_alert": False, "boxes": []}
             confidence = color_result["confidence"]
-            groq = self.confirm_with_groq(
+            gemini = self.confirm_with_gemini(
                 frame, "fire or smoke detected by color analysis", local_confidence=confidence,
                 feature_key="feat-8",
             )
-            if groq is None:
+            if gemini is None:
                 return {"confidence": confidence, "trigger_alert": False, "boxes": []}
             h, w = frame.shape[:2]
             return {
@@ -2417,9 +2837,9 @@ IMPORTANT RULES:
                     "feature_id": "feat-8",
                     "feature_name": "Early Fire Detection",
                     "incident_type": "Early Fire Detection",
-                    "severity_score": int(groq.get("severity_score", 7)),
-                    "groq_description": groq.get("description", "Fire/smoke color pattern detected."),
-                    "threat_level": groq.get("threat_level", "critical"),
+                    "severity_score": int(gemini.get("severity_score", 7)),
+                    "gemini_description": gemini.get("description", "Fire/smoke color pattern detected."),
+                    "threat_level": gemini.get("threat_level", "critical"),
                     "fire_bbox": [0, 0, w, h],
                 },
             }
@@ -2492,10 +2912,10 @@ IMPORTANT RULES:
         if not confirmed_fires or confidence < 0.55:
             return {"confidence": confidence, "trigger_alert": False, "boxes": []}
 
-        # Fire is critical, confirm with Groq if > 0.8 confidence
+        # Fire is critical, confirm with Gemini if > 0.8 confidence
         context = "Fire/Smoke detected. " + "; ".join(reasons)
-        groq = self.confirm_with_groq(frame, context, local_confidence=confidence, feature_key="feat-8")
-        if groq is not None and not groq.get("confirmed", True):
+        gemini = self.confirm_with_gemini(frame, context, local_confidence=confidence, feature_key="feat-8")
+        if gemini is not None and not gemini.get("confirmed", True):
             return {"confidence": confidence, "trigger_alert": False, "boxes": []}
 
         state["alert_cooldown"] = now
@@ -2510,8 +2930,8 @@ IMPORTANT RULES:
                 "feature_id": "feat-8",
                 "feature_name": "Early Fire Detection",
                 "incident_type": "Fire & Smoke",
-                "severity_score": groq.get("severity_score", 9) if groq else 9,
-                "groq_description": groq.get("description", context),
+                "severity_score": gemini.get("severity_score", 9) if gemini else 9,
+                "gemini_description": gemini.get("description", context),
                 "threat_level": "critical",
             },
         }
@@ -2537,7 +2957,7 @@ IMPORTANT RULES:
         except Exception:
             return None
 
-    def confirm_with_groq(
+    def confirm_with_gemini(
         self,
         frame: np.ndarray,
         context_description: str,
@@ -2566,9 +2986,10 @@ IMPORTANT RULES:
                 self._log(f"skipping {feature_key}: night mode requires 0.65+ confidence, got {effective_conf:.2f}")
                 return None
 
-        if self.groq_client is None:
-            # If Groq is unavailable, proceed using local signal.
-            return {
+        if self.gemini_client is None:
+            # If Gemini is unavailable, proceed using local signal.
+            groq_result = self._groq_confirmation(frame, context_description, local_confidence, feature_key, gemini_unavailable=True)
+            return groq_result or {
                 "confirmed": True,
                 "severity_score": int(max(1, min(10, round(local_confidence * 10)))),
                 "description": f"Local detector confirmed: {context_description}",
@@ -2577,20 +2998,20 @@ IMPORTANT RULES:
 
         # Rate-limit: skip if called for same feature within cooldown window.
         now = time.time()
-        last = self._groq_last_call.get(feature_key, 0.0)
-        if now - last < self._groq_cooldown:
-            # Return fallback so detection continues without Groq.
-            return {
+        last = self._gemini_last_call.get(feature_key, 0.0)
+        if now - last < self._gemini_cooldown:
+            # Return fallback so detection continues without Gemini.
+            groq_result = self._groq_confirmation(frame, context_description, local_confidence, feature_key, rate_limited=True)
+            return groq_result or {
                 "confirmed": True,
                 "severity_score": int(max(1, min(10, round(local_confidence * 10)))),
                 "description": f"Local confirmation (rate-limited): {context_description}",
                 "threat_level": "high" if local_confidence >= 0.8 else "medium",
             }
-        self._groq_last_call[feature_key] = now
+        self._gemini_last_call[feature_key] = now
 
-        frame_b64 = self._frame_to_base64(frame)
-        if frame_b64 is None:
-            return None
+        import PIL.Image
+        pil_img = PIL.Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
 
         prompt = (
             f"This is a public safety camera. {context_description}. Analyse this frame and respond in JSON format "
@@ -2599,42 +3020,34 @@ IMPORTANT RULES:
         )
 
         try:
-            response = self.groq_client.chat.completions.create(
-                model=self.groq_model,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"},
-                            },
-                        ],
-                    }
-                ],
-                max_tokens=300,
-            )
-            text = ""
-            if response and response.choices:
-                text = str(response.choices[0].message.content or "")
-            parsed = self._extract_json_from_text(text)
+            response = self.gemini_client.generate_content([prompt, pil_img])
+            
+            raw = (response.text or "").strip()
+            parsed = self._extract_json_from_text(raw)
             if not parsed:
                 return None
+            
+            # Enrich result with thinking/reasoning if available
+            if hasattr(response, 'candidates') and response.candidates:
+                thought = getattr(response.candidates[0], 'thought', None)
+                if thought:
+                    parsed["gemini_reasoning"] = thought
+
             if parsed.get("confirmed") is True:
                 return {
                     "confirmed": True,
                     "severity_score": int(parsed.get("severity_score", max(1, min(10, round(local_confidence * 10))))),
                     "description": str(parsed.get("description", context_description)),
                     "threat_level": str(parsed.get("threat_level", "medium")),
+                    "gemini_reasoning": parsed.get("gemini_reasoning")
                 }
             
             # False Positive Learning
             now = time.time()
-            self.groq_rejections[feature_key].append(now)
+            self.gemini_rejections[feature_key].append(now)
             # Remove old rejections (older than 1 hour)
-            self.groq_rejections[feature_key] = [t for t in self.groq_rejections[feature_key] if now - t < 3600]
-            rejections = len(self.groq_rejections[feature_key])
+            self.gemini_rejections[feature_key] = [t for t in self.gemini_rejections[feature_key] if now - t < 3600]
+            rejections = len(self.gemini_rejections[feature_key])
             
             if rejections >= 5:
                 self.feature_threshold_penalties[feature_key] = 0.30
@@ -2645,8 +3058,19 @@ IMPORTANT RULES:
 
             return None
         except Exception as exc:
-            # Graceful fallback: continue with local confidence if Groq fails.
-            self._log(f"groq confirm failed, using local fallback: {exc}")
+            error_text = str(exc)
+            if self._is_gemini_quota_error(error_text):
+                now = time.time()
+                retry_seconds = self._parse_gemini_retry_seconds(error_text)
+                self.gemini_retry_until = now + retry_seconds
+                self.gemini_last_rl_log = now
+                self._log("[fallback] using Groq vision - Gemini quota exceeded")
+                groq_result = self._groq_confirmation(frame, context_description, local_confidence, feature_key, rate_limited=True, retry_after_seconds=int(retry_seconds))
+                if groq_result is not None:
+                    return groq_result
+
+            # Graceful fallback: continue with local confidence if Gemini fails.
+            self._log(f"gemini confirm failed, using local fallback: {exc}")
             return {
                 "confirmed": True,
                 "severity_score": int(max(1, min(10, round(local_confidence * 10)))),
@@ -2654,45 +3078,91 @@ IMPORTANT RULES:
                 "threat_level": "high" if local_confidence >= 0.8 else "medium",
             }
 
-    def groq_backup_ocr(self, plate_image: np.ndarray) -> str | None:
-        if self.groq_client is None:
+    def _groq_confirmation(
+        self,
+        frame: np.ndarray,
+        context_description: str,
+        local_confidence: float,
+        feature_key: str,
+        rate_limited: bool = False,
+        retry_after_seconds: int = 0,
+        gemini_unavailable: bool = False,
+    ) -> dict[str, Any] | None:
+        prompt = (
+            f"This is a public safety camera. {context_description}. Analyse this frame and respond in JSON format "
+            "with these exact fields: confirmed (boolean), severity_score (integer 1-10), "
+            "description (plain English explanation of what you see), threat_level (low/medium/high/critical)"
+        )
+        try:
+            raw = self._groq_vision_prompt(frame, prompt)
+            if not raw:
+                return None
+            parsed = self._extract_json_from_text(raw)
+            if not parsed:
+                return None
+            if parsed.get("confirmed") is True:
+                result = {
+                    "confirmed": True,
+                    "severity_score": int(parsed.get("severity_score", max(1, min(10, round(local_confidence * 10))))),
+                    "description": str(parsed.get("description", context_description)),
+                    "threat_level": str(parsed.get("threat_level", "medium")),
+                    "gemini_reasoning": parsed.get("groq_summary") or parsed.get("gemini_reasoning"),
+                    "source": "groq_vision",
+                    "fallback": True,
+                }
+                if rate_limited:
+                    result["rate_limited"] = True
+                if retry_after_seconds:
+                    result["retry_after_seconds"] = retry_after_seconds
+                if gemini_unavailable:
+                    result["gemini_unavailable"] = True
+                print("[fallback] using Groq vision - Gemini quota exceeded")
+                return result
             return None
-        b64 = self._frame_to_base64(plate_image)
-        if b64 is None:
+        except Exception as exc:
+            self._log(f"groq confirmation failed: {exc}")
             return None
+
+    def gemini_backup_ocr(self, plate_image: np.ndarray) -> str | None:
+        if self.gemini_client is None:
+            return self._groq_backup_ocr(plate_image)
+        
+        import PIL.Image
+        pil_img = PIL.Image.fromarray(cv2.cvtColor(plate_image, cv2.COLOR_BGR2RGB))
+        
         prompt = (
             "Read only the Indian vehicle number plate text from this image. "
             "Return only one value in format XX00XX0000 without explanation."
         )
         try:
-            response = self.groq_client.chat.completions.create(
-                model=self.groq_model,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
-                            },
-                        ],
-                    }
-                ],
-                max_tokens=60,
-            )
-            text = ""
-            if response and response.choices:
-                text = str(response.choices[0].message.content or "")
+            response = self.gemini_client.generate_content([prompt, pil_img])
+            
+            text = (response.text or "").strip()
             cleaned = re.sub(r"[^A-Za-z0-9]", "", text).upper()
             return cleaned if self.plate_regex.match(cleaned) else None
         except Exception as exc:
-            self._log(f"groq backup ocr failed: {exc}")
+            error_text = str(exc)
+            if self._is_gemini_quota_error(error_text):
+                now = time.time()
+                retry_seconds = self._parse_gemini_retry_seconds(error_text)
+                self.gemini_retry_until = now + retry_seconds
+                self.gemini_last_rl_log = now
+                self._log("[fallback] using Groq vision - Gemini quota exceeded")
+                return self._groq_backup_ocr(plate_image)
+
+            self._log(f"gemini backup ocr failed: {exc}")
             return None
 
-    def groq_backup_detection(self, frame: np.ndarray, model_name: str, context: str) -> bool:
+    def _groq_backup_ocr(self, plate_image: np.ndarray) -> str | None:
+        raw = self._groq_ocr_prompt(plate_image)
+        if not raw:
+            return None
+        cleaned = re.sub(r"[^A-Za-z0-9]", "", raw).upper()
+        return cleaned if self.plate_regex.match(cleaned) else None
+
+    def gemini_backup_detection(self, frame: np.ndarray, model_name: str, context: str) -> bool:
         prompt = f"Local model {model_name} is uncertain: {context}. Confirm if this risk is real. Return JSON with confirmed boolean."
-        result = self.confirm_with_groq(frame, prompt, local_confidence=0.65)
+        result = self.confirm_with_gemini(frame, prompt, local_confidence=0.65)
         return bool(result and result.get("confirmed"))
 
     def draw_detections(self, frame: np.ndarray, detections: list[dict[str, Any]]) -> None:

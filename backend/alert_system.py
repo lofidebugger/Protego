@@ -219,6 +219,7 @@ class AlertSystem:
         self.twilio_token = os.getenv("TWILIO_AUTH_TOKEN", "").strip()
         self.twilio_phone = os.getenv("TWILIO_PHONE_NUMBER", "").strip()
         self.twilio_client = TwilioClient(self.twilio_sid, self.twilio_token) if self.twilio_sid and self.twilio_token else None
+        self.google_places_api_key = os.getenv("GOOGLE_PLACES_API_KEY", "").strip()
 
         # Layer 4: Email rate limiting (Max 3/hour)
         self.emails_sent_this_hour = 0
@@ -230,6 +231,14 @@ class AlertSystem:
 
         self.authority_cache: dict[str, dict[str, Any]] = {}
         self.email_cache: dict[str, str] = {}
+        self.pending_popups: list[dict[str, Any]] = []
+        self._popup_lock = threading.Lock()
+
+        # Session overrides for hackathon judges
+        self.session_email = None
+        self.session_phone = None
+        self.session_telegram_chat_id = None
+        self.session_telegram_code = None  # Temporary code for /start verification
 
         self.load_contacts()
         self._load_contacts_json()
@@ -277,6 +286,97 @@ class AlertSystem:
 
     def reload_contacts(self) -> None:
         self.load_contacts()
+
+    def register_session_contact(self, email: str | None = None, phone: str | None = None, telegram_chat_id: str | None = None) -> None:
+        if email: self.session_email = str(email).strip()
+        if phone: self.session_phone = str(phone).strip()
+        if telegram_chat_id: self.session_telegram_chat_id = str(telegram_chat_id).strip()
+        self._log(f"session contact registered: email={self.session_email}, phone={self.session_phone}, telegram={self.session_telegram_chat_id}")
+
+    def get_nearby_emergency_services(self, lat: float, lng: float) -> list[dict[str, Any]]:
+        if not lat or not lng:
+            return []
+
+        try:
+            services: list[dict[str, Any]] = []
+
+            if self.google_places_api_key:
+                base_url = "https://maps.googleapis.com/maps/api/place/nearbysearch/json"
+                details_url = "https://maps.googleapis.com/maps/api/place/details/json"
+                service_types = ["hospital", "police", "fire_station"]
+
+                for place_type in service_types:
+                    response = requests.get(
+                        base_url,
+                        params={
+                            "location": f"{lat},{lng}",
+                            "radius": 5000,
+                            "type": place_type,
+                            "key": self.google_places_api_key,
+                        },
+                        timeout=20,
+                    )
+                    data = response.json() if response.status_code == 200 else {}
+                    for place in (data.get("results") or [])[:5]:
+                        place_lat = float((place.get("geometry") or {}).get("location", {}).get("lat", 0.0) or 0.0)
+                        place_lng = float((place.get("geometry") or {}).get("location", {}).get("lng", 0.0) or 0.0)
+                        if not place_lat or not place_lng:
+                            continue
+
+                        distance_km = geodesic((lat, lng), (place_lat, place_lng)).kilometers
+                        phone = ""
+                        address = str(place.get("vicinity") or place.get("formatted_address") or "").strip()
+                        place_id = str(place.get("place_id") or "").strip()
+                        if place_id:
+                            details_resp = requests.get(
+                                details_url,
+                                params={
+                                    "place_id": place_id,
+                                    "fields": "formatted_phone_number,international_phone_number,name,formatted_address,website",
+                                    "key": self.google_places_api_key,
+                                },
+                                timeout=20,
+                            )
+                            details = details_resp.json() if details_resp.status_code == 200 else {}
+                            result = details.get("result", {}) or {}
+                            phone = str(result.get("formatted_phone_number") or result.get("international_phone_number") or "").strip()
+                            address = str(result.get("formatted_address") or address).strip()
+
+                        services.append(
+                            {
+                                "name": str(place.get("name") or "Unknown").strip(),
+                                "type": place_type,
+                                "phone": phone,
+                                "distance": round(distance_km, 2),
+                                "google_maps_link": f"https://www.google.com/maps/search/?api=1&query={place_lat},{place_lng}",
+                                "address": address,
+                                "source": "Google Places",
+                            }
+                        )
+
+            if not services:
+                nearby = self.location_services.find_nearby_authorities(lat, lng, radius_meters=5000)
+                for place_type in ["hospital", "police", "fire"]:
+                    for place in (nearby.get(place_type, []) or [])[:5]:
+                        place_lat = float((place.get("coordinates") or {}).get("lat", lat) or lat)
+                        place_lng = float((place.get("coordinates") or {}).get("lon", lng) or lng)
+                        services.append(
+                            {
+                                "name": str(place.get("name") or "Unknown").strip(),
+                                "type": place_type,
+                                "phone": str(place.get("phone") or place.get("emergency_phone") or "").strip(),
+                                "distance": round(float(place.get("distance_km", 0.0) or 0.0), 2),
+                                "google_maps_link": f"https://www.google.com/maps/search/?api=1&query={place_lat},{place_lng}",
+                                "address": str(place.get("address") or "").strip(),
+                                "source": "Overpass",
+                            }
+                        )
+
+            services.sort(key=lambda item: float(item.get("distance", 999.0) or 999.0))
+            return services[:10]
+        except Exception as exc:
+            self._log(f"nearby services lookup failed: {exc}")
+            return []
 
     def get_contacts_by_type(self, authority_type: str) -> list[dict[str, Any]]:
         return [c for c in self.contacts_cache if str(c.get("authority_type", "")).lower() == authority_type.lower()]
@@ -955,15 +1055,16 @@ out center tags;
                 nearest.append(rows[0])
         return nearest
 
-    def search_major_authorities_tavily(self, location_str: str, city: str = "", state: str = "") -> dict[str, list[dict[str, Any]]]:
+    def search_major_authorities_tavily(
+        self,
+        location_str: str,
+        city: str = "",
+        state: str = "",
+        latitude: float = 0.0,
+        longitude: float = 0.0,
+    ) -> dict[str, list[dict[str, Any]]]:
         try:
             import json
-            from tavily import TavilyClient
-            from groq import Groq
-
-            key = os.getenv("TAVILY_API_KEY", "")
-            if not key:
-                return {"hospital": [], "police": []}
 
             cache = getattr(self, "_tavily_cache", {})
             if (
@@ -973,13 +1074,31 @@ out center tags;
                 print("[tavily] using cache!!")
                 return cache.get("result", {"hospital": [], "police": []})
 
+            google_result = self._google_places_major_authorities(latitude, longitude, location_str)
+            if google_result.get("hospital") or google_result.get("police"):
+                self._tavily_cache = {
+                    "location": location_str,
+                    "result": google_result,
+                    "timestamp": time.time(),
+                }
+                print(f"[nearby-services] {len(google_result['hospital'])} hospitals, {len(google_result['police'])} police found!!")
+                return google_result
+
+            key = os.getenv("TAVILY_API_KEY", "")
+            if not key:
+                return google_result
+
+            from tavily import TavilyClient
+
             search_loc = city or state or location_str
             client = TavilyClient(api_key=key)
 
-            groq_key = os.getenv("GROQ_API_KEY", "").strip()
-            if not groq_key:
+            gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+            if not gemini_key:
                 return {"hospital": [], "police": []}
-            groq_client = Groq(api_key=groq_key)
+            import google.generativeai as genai
+            genai.configure(api_key=gemini_key)
+            gemini_client = genai.GenerativeModel("gemini-2.5-flash")
 
             print(f"[tavily] searching: {search_loc}...")
 
@@ -1045,14 +1164,8 @@ Rules:
 - Return ONLY valid JSON nothing else
 """
 
-            resp = groq_client.chat.completions.create(
-                model="meta-llama/llama-4-scout-17b-16e-instruct",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=600,
-                temperature=0.1,
-            )
-
-            raw = (resp.choices[0].message.content or "").strip()
+            gemini_resp = gemini_client.generate_content(prompt)
+            raw = (gemini_resp.text or "").strip()
             if "```" in raw:
                 parts = raw.split("```")
                 for part in parts:
@@ -1119,6 +1232,44 @@ Rules:
                 "police": [],
             }
 
+    def _google_places_major_authorities(
+        self,
+        latitude: float,
+        longitude: float,
+        location_label: str = "",
+    ) -> dict[str, list[dict[str, Any]]]:
+        if not latitude or not longitude:
+            return {"hospital": [], "police": []}
+
+        try:
+            services = self.get_nearby_emergency_services(latitude, longitude)
+            result: dict[str, list[dict[str, Any]]] = {"hospital": [], "police": []}
+
+            for service in services:
+                service_type = str(service.get("type", "")).lower()
+                entry = {
+                    "name": str(service.get("name", "Unknown")).strip(),
+                    "phone": str(service.get("phone", "")).strip(),
+                    "address": str(service.get("address", location_label) or location_label).strip(),
+                    "distance_km": float(service.get("distance", 0.0) or 0.0),
+                    "source": "Google Places",
+                    "google_maps_link": str(service.get("google_maps_link", "")).strip(),
+                    "has_real_phone": bool(service.get("phone")),
+                }
+
+                if service_type == "hospital":
+                    result["hospital"].append(entry)
+                elif service_type in {"police", "police_station"}:
+                    result["police"].append(entry)
+
+            for key in ("hospital", "police"):
+                result[key] = sorted(result[key], key=lambda row: float(row.get("distance_km", 999.0) or 999.0))[:6]
+
+            return result
+        except Exception as exc:
+            print(f"[google-places] error: {exc}")
+            return {"hospital": [], "police": []}
+
     def search_nearest_city_authorities(
         self,
         full_address: str,
@@ -1128,7 +1279,6 @@ Rules:
         try:
             import json
             from tavily import TavilyClient
-            from groq import Groq
 
             key = os.getenv("TAVILY_API_KEY", "")
             if not key:
@@ -1142,17 +1292,53 @@ Rules:
             if cached and time.time() - float(cached.get("ts", 0.0) or 0.0) < 1800:
                 return cached.get("data")
 
+            gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
             groq_key = os.getenv("GROQ_API_KEY", "").strip()
-            if not groq_key:
-                return None
-            groq_client = Groq(api_key=groq_key)
 
-            city_resp = groq_client.chat.completions.create(
-                model="meta-llama/llama-4-scout-17b-16e-instruct",
-                messages=[
-                    {
-                        "role": "user",
-                                                "content": f"""Given this location: {full_address}
+            def _safe_json_block(raw_text: str) -> dict[str, Any] | None:
+                raw = (raw_text or "").strip()
+                if not raw:
+                    return None
+
+                if "```" in raw:
+                    parts = raw.split("```")
+                    for part in parts:
+                        part = part.strip()
+                        if part.startswith("json"):
+                            part = part[4:].strip()
+                        if part.startswith("{"):
+                            raw = part
+                            break
+
+                start = raw.find("{")
+                end = raw.rfind("}")
+                if start == -1 or end == -1 or end <= start:
+                    return None
+
+                try:
+                    return json.loads(raw[start : end + 1])
+                except Exception:
+                    return None
+
+            def _fallback_city_name() -> str:
+                candidate = ", ".join(part for part in [city, state] if part).strip() or full_address.strip()
+                if not candidate:
+                    return "India"
+                parts = [p.strip() for p in candidate.split(",") if p.strip()]
+                if len(parts) >= 2:
+                    return f"{parts[-2]}, {parts[-1]}"
+                return parts[0]
+
+            nearest_city = ""
+            gemini_model = None
+            if gemini_key:
+                try:
+                    import google.generativeai as genai
+
+                    genai.configure(api_key=gemini_key)
+                    gemini_model = genai.GenerativeModel("gemini-2.5-flash")
+                    city_resp = gemini_model.generate_content(
+                        f"""Given this location: {full_address}
 
 Determine the best city to search
 for major hospitals and emergency
@@ -1174,18 +1360,16 @@ Reply with ONLY: CityName, State
 Example: Palai, Kerala
 Example: Kottayam, Kerala
 Example: Ernakulam, Kerala
-Nothing else!!""",
-                    }
-                ],
-                max_tokens=30,
-                temperature=0.1,
-            )
+Nothing else!!"""
+                    )
+                    nearest_city = (city_resp.text or "").strip()
+                except Exception as exc:
+                    self._log(f"[city-auth] gemini city resolution failed: {exc}")
 
-            nearest_city = (city_resp.choices[0].message.content or "").strip()
             if not nearest_city:
-                nearest_city = ", ".join(part for part in [city, state] if part) or full_address
+                nearest_city = _fallback_city_name()
 
-            print(f"[tavily] nearest city: {nearest_city}")
+            self._log(f"[city-auth] nearest city resolved: {nearest_city}")
 
             client = TavilyClient(api_key=key)
             hosp = client.search(
@@ -1270,25 +1454,47 @@ Rules:
 - Return ONLY valid JSON!
 """
 
-            resp = groq_client.chat.completions.create(
-                model="meta-llama/llama-4-scout-17b-16e-instruct",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=700,
-                temperature=0.1,
-            )
+            data: dict[str, Any] | None = None
 
-            raw = (resp.choices[0].message.content or "").strip()
-            if "```" in raw:
-                parts = raw.split("```")
-                for p in parts:
-                    p = p.strip()
-                    if p.startswith("json"):
-                        p = p[4:].strip()
-                    if p.startswith("{"):
-                        raw = p
-                        break
+            if gemini_model is not None:
+                try:
+                    resp = gemini_model.generate_content(prompt)
+                    data = _safe_json_block(getattr(resp, "text", "") or "")
+                except Exception as exc:
+                    self._log(f"[city-auth] gemini extraction failed: {exc}")
 
-            data = json.loads(raw)
+            if data is None and groq_key:
+                try:
+                    from groq import Groq
+
+                    groq_client = Groq(api_key=groq_key)
+                    groq_resp = groq_client.chat.completions.create(
+                        model="llama-3.3-70b-versatile",
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": "Return only valid JSON. No markdown. No explanation.",
+                            },
+                            {
+                                "role": "user",
+                                "content": prompt,
+                            },
+                        ],
+                        temperature=0.1,
+                        max_tokens=1400,
+                    )
+                    groq_text = ""
+                    if groq_resp and getattr(groq_resp, "choices", None):
+                        groq_text = str(groq_resp.choices[0].message.content or "")
+                    data = _safe_json_block(groq_text)
+                    if data is not None:
+                        self._log("[city-auth] used Groq fallback for Tavily extraction")
+                except Exception as exc:
+                    self._log(f"[city-auth] groq extraction failed: {exc}")
+
+            if data is None:
+                data = {"nearest_city": nearest_city, "hospitals": [], "police_stations": []}
+
             result: dict[str, Any] = {
                 "nearest_city": nearest_city,
                 "hospitals": [],
@@ -1325,6 +1531,68 @@ Rules:
                     }
                 )
 
+            # Guaranteed non-empty baseline so UI never shows a blank panel.
+            if not result["hospitals"]:
+                normalized = nearest_city.lower()
+                city_key = ""
+                for key_name in _CITY_TOP_HOSPITALS.keys():
+                    if key_name in normalized:
+                        city_key = key_name
+                        break
+                if city_key:
+                    for row in _CITY_TOP_HOSPITALS.get(city_key, [])[:3]:
+                        result["hospitals"].append(
+                            {
+                                "name": row.get("name", "Major Hospital"),
+                                "phone": row.get("phone", "108"),
+                                "email": row.get("email", ""),
+                                "type": "Hospital",
+                                "address": nearest_city,
+                                "speciality": row.get("capability", ""),
+                                "has_real_phone": bool(row.get("phone")),
+                                "has_email": bool(row.get("email")),
+                            }
+                        )
+                else:
+                    result["hospitals"].append(
+                        {
+                            "name": f"District Government Hospital, {nearest_city}",
+                            "phone": "108",
+                            "email": "",
+                            "type": "Government",
+                            "address": nearest_city,
+                            "speciality": "Emergency",
+                            "has_real_phone": False,
+                            "has_email": False,
+                        }
+                    )
+
+            if not result["police_stations"]:
+                fallback_police = _MAJOR_AUTHORITIES.get("hyderabad", {}).get("police", [])[:1]
+                if fallback_police:
+                    for row in fallback_police:
+                        result["police_stations"].append(
+                            {
+                                "name": row.get("name", f"District Police Control Room, {nearest_city}"),
+                                "phone": row.get("phone", "100"),
+                                "email": row.get("email", ""),
+                                "address": nearest_city,
+                                "has_real_phone": bool(row.get("phone")),
+                                "has_email": bool(row.get("email")),
+                            }
+                        )
+                else:
+                    result["police_stations"].append(
+                        {
+                            "name": f"District Police Control Room, {nearest_city}",
+                            "phone": "100",
+                            "email": "",
+                            "address": nearest_city,
+                            "has_real_phone": False,
+                            "has_email": False,
+                        }
+                    )
+
             if not hasattr(self, "_city_auth_cache"):
                 self._city_auth_cache = {}
             self._city_auth_cache[cache_key] = {
@@ -1339,7 +1607,32 @@ Rules:
             return result
         except Exception as e:
             print(f"[tavily-city] error: {e}")
-            return None
+            nearest_city = ", ".join(part for part in [city, state] if part).strip() or full_address or "Unknown"
+            return {
+                "nearest_city": nearest_city,
+                "hospitals": [
+                    {
+                        "name": f"District Government Hospital, {nearest_city}",
+                        "phone": "108",
+                        "email": "",
+                        "type": "Government",
+                        "address": nearest_city,
+                        "speciality": "Emergency",
+                        "has_real_phone": False,
+                        "has_email": False,
+                    }
+                ],
+                "police_stations": [
+                    {
+                        "name": f"District Police Control Room, {nearest_city}",
+                        "phone": "100",
+                        "email": "",
+                        "address": nearest_city,
+                        "has_real_phone": False,
+                        "has_email": False,
+                    }
+                ],
+            }
 
     # Compatibility alias used by rules engine.
     def find_nearest(self, latitude: float, longitude: float, authority_types: list[str]) -> list[dict[str, Any]]:
@@ -1374,8 +1667,12 @@ Rules:
         severity_label, severity_note = self._severity_language(severity)
         incident = alert_object.get("incident_type", "Unknown Incident")
         location = alert_object.get("location", "Unknown Location")
+        lat = float(alert_object.get("camera_latitude", alert_object.get("latitude", 0.0)) or 0.0)
+        lon = float(alert_object.get("camera_longitude", alert_object.get("longitude", 0.0)) or 0.0)
+        if location.lower() in {"unknown", "unknown location"} and lat and lon:
+            location = f"Lat: {lat:.4f}, Lon: {lon:.4f}"
         timestamp = self._format_timestamp(alert_object.get("timestamp"))
-        description = str(alert_object.get("groq_description") or "No description available.")
+        description = str(alert_object.get("gemini_description") or alert_object.get("groq_description") or "No description available.")
         if len(description) > 260:
             description = description[:257] + "..."
         authority_name = nearest.get("name", "Emergency Services")
@@ -1409,102 +1706,52 @@ Rules:
         return caption
 
     def _generate_telegram_message(self, incident: dict[str, Any]) -> str:
-        try:
-            from groq import Groq
-
-            client = Groq(api_key=os.getenv("GROQ_API_KEY", ""))
-
-            feature = incident.get("incident_type", "Incident")
-            severity = incident.get("severity_score", 7)
-            location = incident.get("location", "Unknown")
-            description = incident.get("description") or incident.get("groq_description", "")
-            action = incident.get("action") or incident.get("recommended_action", "")
-            nearby = incident.get("nearby_authorities", {}) or {}
-            city_auth = getattr(self, "_city_auth_cache", {})
-
-            nearest_hosp = ""
-            nearest_pol = ""
-            hosp_list = nearby.get("hospital", [])
-            pol_list = nearby.get("police", [])
-
-            if hosp_list:
-                h = hosp_list[0]
-                nearest_hosp = f"{h.get('name', '')} ({h.get('distance_km', '?')}km, {h.get('phone', '')})"
-            if pol_list:
-                p = pol_list[0]
-                nearest_pol = f"{p.get('name', '')} ({p.get('distance_km', '?')}km, {p.get('phone', '')})"
-
-            city_cache: dict[str, Any] = {}
-            for value in city_auth.values():
-                if isinstance(value, dict):
-                    city_cache = value.get("data", {})
-                    break
-
-            city_name = city_cache.get("nearest_city", "")
-            city_hospitals = city_cache.get("hospitals", [])[:2]
-            city_police = city_cache.get("police_stations", [])[:1]
-
-            city_info = ""
-            if city_hospitals:
-                city_info += "\nMajor city hospitals: " + ", ".join(
-                    f"{h.get('name', '')} ({h.get('phone', '')})" for h in city_hospitals
-                )
-            if city_police:
-                city_info += (
-                    "\nCity police: "
-                    + city_police[0].get("name", "")
-                    + f" ({city_police[0].get('phone', '')})"
-                )
-
-            prompt = f"""
-Write a professional Telegram alert
-message for a public safety system.
-
-Incident: {feature}
-Severity: {severity}/10
-Location: {location}
-Description: {description}
-Recommended Action: {action}
-Nearest Hospital: {nearest_hosp or 'Not found'}
-Nearest Police: {nearest_pol or 'Not found'}
-{f'Nearest Major City: {city_name}' if city_name else ''}
-{city_info}
-
-Write a concise, human-sounding
-Telegram message. NOT robotic.
-Use emojis naturally.
-Max 15 lines.
-Include:
-- What happened and where
-- Severity level
-- Nearest hospital and police
-- What action is needed
-- Emergency numbers (100, 108, 112)
-
-Write it as if a real safety
-officer is sending this alert!!
-"""
-
-            resp = client.chat.completions.create(
-                model="meta-llama/llama-4-scout-17b-16e-instruct",
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=400,
-                temperature=0.7,
-            )
-            return (resp.choices[0].message.content or "").strip()
-        except Exception as e:
-            print(f"[groq-telegram] {e}")
-            return (
-                f"🚨 PROTEGO ALERT\n\n"
-                f"Incident: {incident.get('incident_type')}\n"
-                f"Severity: {incident.get('severity_score')}/10\n"
-                f"Location: {incident.get('location')}\n\n"
-                f"Please respond immediately!\n"
-                f"Emergency: 112"
-            )
+        feature = incident.get("incident_type", "Incident")
+        severity = incident.get("severity_score", 7)
+        location = incident.get("location", "Unknown Location")
+        lat = float(incident.get("camera_latitude", incident.get("latitude", 0.0)) or 0.0)
+        lon = float(incident.get("camera_longitude", incident.get("longitude", 0.0)) or 0.0)
+        if location.lower() in {"unknown", "unknown location"} and lat and lon:
+            location = f"Lat: {lat:.4f}, Lon: {lon:.4f}"
+        description = incident.get("description") or incident.get("gemini_description", "") or incident.get("groq_description", "")
+        action = incident.get("action") or incident.get("recommended_action", "")
+        
+        nearby = incident.get("nearby_authorities", {}) or {}
+        hosp_list = nearby.get("hospital", [])[:3]
+        pol_list = nearby.get("police", [])[:2]
+        
+        severity_emoji = "🔴" if severity >= 8 else "🟠" if severity >= 5 else "🟡"
+        
+        msg = f"<b>🚨 PROTEGO URGENT ALERT {severity_emoji}</b>\n\n"
+        msg += f"<b>Incident:</b> {feature}\n"
+        msg += f"<b>Severity:</b> {severity}/10\n"
+        msg += f"<b>Location:</b> {location}\n\n"
+        
+        msg += f"<b>📝 AI Analysis:</b>\n{description}\n\n"
+        
+        if action:
+            msg += f"<b>⚡ Action Needed:</b>\n{action}\n\n"
+            
+        msg += f"<b>🏥 Nearby Hospitals:</b>\n"
+        if hosp_list:
+            for h in hosp_list:
+                msg += f"• {h.get('name', 'Unknown')} - {h.get('phone', '108')} ({h.get('distance_km', '?')}km)\n"
+        else:
+            msg += "• None found nearby\n"
+            
+        msg += f"\n<b>👮 Nearby Police Stations:</b>\n"
+        if pol_list:
+            for p in pol_list:
+                msg += f"• {p.get('name', 'Unknown')} - {p.get('phone', '100')} ({p.get('distance_km', '?')}km)\n"
+        else:
+            msg += "• None found nearby\n"
+            
+        msg += "\n<i>Protego AI Public Safety System - Powered by Groq Vision AI</i>"
+        return msg
 
     def send_telegram(self, alert_object: dict[str, Any], screenshot_base64: str | None) -> str:
-        if not self.telegram_token or not self.telegram_chat_id:
+        target_chat_id = self.session_telegram_chat_id or self.telegram_chat_id
+        if not self.telegram_token or not target_chat_id:
             return "failed: telegram not configured"
 
         message = self._generate_telegram_message(alert_object)
@@ -1524,15 +1771,45 @@ officer is sending this alert!!
             async with bot:
                 if image_bytes:
                     await bot.send_photo(
-                        chat_id=self.telegram_chat_id,
+                        chat_id=target_chat_id,
                         photo=image_bytes,
-                        caption=message[:1024],
+                        caption="📸 <b>Incident Screenshot captured by Protego System</b>",
+                        parse_mode="HTML"
                     )
-                else:
-                    await bot.send_message(
-                        chat_id=self.telegram_chat_id,
-                        text=message,
-                    )
+                
+                await bot.send_message(
+                    chat_id=target_chat_id,
+                    text=message,
+                    parse_mode="HTML"
+                )
+
+                try:
+                    from gtts import gTTS
+                    import tempfile
+                    
+                    feature = alert_object.get("incident_type", "Incident")
+                    severity = alert_object.get("severity_score", 7)
+                    location = alert_object.get("location", "Unknown Location")
+                    lat = float(alert_object.get("camera_latitude", alert_object.get("latitude", 0.0)) or 0.0)
+                    lon = float(alert_object.get("camera_longitude", alert_object.get("longitude", 0.0)) or 0.0)
+                    if location.lower() in {"unknown", "unknown location"} and lat and lon:
+                        location = "the marked GPS coordinates"
+                    tts_text = f"Protego Emergency Alert. {feature} detected at {location}. Severity is {severity} out of 10. Immediate action is required."
+                    tts = gTTS(text=tts_text, lang='en', tld='co.in')
+                    
+                    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as fp:
+                        tts.save(fp.name)
+                        temp_path = fp.name
+                    
+                    with open(temp_path, "rb") as audio_file:
+                        await bot.send_voice(
+                            chat_id=target_chat_id,
+                            voice=audio_file,
+                            caption="🔊 Automated Voice Alert"
+                        )
+                    os.unlink(temp_path)
+                except Exception as tts_e:
+                    self._log(f"telegram tts failed: {tts_e}")
 
         try:
             asyncio.run(_send())
@@ -1548,7 +1825,7 @@ officer is sending this alert!!
         camera_name = str(alert_object.get("camera_name", "Surveillance Camera"))
         camera_id = str(alert_object.get("camera_id", "PRO-789"))
         severity_score = int(alert_object.get("severity_score", 0))
-        description = str(alert_object.get("groq_description") or "No AI assessment available.")
+        description = str(alert_object.get("gemini_description") or alert_object.get("groq_description") or "No AI assessment available.")
         timestamp = self._format_timestamp(alert_object.get("timestamp"))
         confidence = int(alert_object.get("confidence", 0.65) * 100) if isinstance(alert_object.get("confidence"), float) else 85
         
@@ -1589,6 +1866,60 @@ officer is sending this alert!!
         # Authorities alerted list
         auth_alerted = alert_object.get("authority_alerted", []) or [institution_name]
         auth_alerted_str = ", ".join(auth_alerted)
+
+        # Extract nearby authorities for the email
+        nearby = alert_object.get("nearby_authorities", {}) or {}
+        hosp_list = nearby.get("hospital", [])[:3]
+        pol_list = nearby.get("police", [])[:2]
+
+        hospitals_html = ""
+        if hosp_list:
+            for h in hosp_list:
+                h_name = h.get('name', 'Unknown Hospital')
+                h_phone = h.get('phone', '108')
+                h_dist = h.get('distance_km', '?')
+                hospitals_html += f"""
+                <div style="margin-bottom: 8px;">
+                    <strong>{h_name}</strong><br>
+                    <span style="color: #666; font-size: 12px;">📞 {h_phone} | 📍 {h_dist}km away</span>
+                </div>
+                """
+        else:
+            hospitals_html = "<p style='color: #888; font-size: 13px; margin: 0;'>No nearby hospitals found in database.</p>"
+
+        police_html = ""
+        if pol_list:
+            for p in pol_list:
+                p_name = p.get('name', 'Unknown Police Station')
+                p_phone = p.get('phone', '100')
+                p_dist = p.get('distance_km', '?')
+                police_html += f"""
+                <div style="margin-bottom: 8px;">
+                    <strong>{p_name}</strong><br>
+                    <span style="color: #666; font-size: 12px;">📞 {p_phone} | 📍 {p_dist}km away</span>
+                </div>
+                """
+        else:
+            police_html = "<p style='color: #888; font-size: 13px; margin: 0;'>No nearby police stations found in database.</p>"
+
+        nearby_html = f"""
+    <!-- Nearby Authorities Box -->
+    <div style="margin: 0 30px 20px; background: #f8f9fa; border: 1px solid #ddd; padding: 15px; border-radius: 4px;">
+        <h3 style="color: #333; margin: 0 0 12px;">🏥 NEARBY EMERGENCY SERVICES</h3>
+        <table style="width: 100%; border-collapse: collapse;">
+            <tr>
+                <td style="width: 50%; vertical-align: top; padding-right: 10px;">
+                    <h4 style="color: #e63946; margin: 0 0 8px; font-size: 14px;">Hospitals / Medical</h4>
+                    {hospitals_html}
+                </td>
+                <td style="width: 50%; vertical-align: top; padding-left: 10px; border-left: 1px solid #eee;">
+                    <h4 style="color: #0077b6; margin: 0 0 8px; font-size: 14px;">Police / Law Enforcement</h4>
+                    {police_html}
+                </td>
+            </tr>
+        </table>
+    </div>
+        """
 
         return f"""
 <div style="font-family: Arial, sans-serif; max-width: 650px; margin: 0 auto; background: #ffffff; border: 2px solid #e63946; border-radius: 8px; overflow: hidden;">
@@ -1674,6 +2005,8 @@ officer is sending this alert!!
         </p>
     </div>
 
+{nearby_html}
+
     <!-- Demo Notice -->
     <div style="margin: 0 30px 20px; background: #f8f9fa; border: 1px dashed #999; padding: 12px; border-radius: 4px;">
         <p style="color: #666; font-size: 12px; margin: 0;">
@@ -1717,7 +2050,8 @@ officer is sending this alert!!
 
         msg = MIMEMultipart("related")
         msg["From"] = self.gmail_address
-        msg["To"] = demo_email
+        target_email = str(self.session_email or demo_email or self.gmail_address).strip()
+        msg["To"] = target_email
         msg["Subject"] = self._get_subject_line(alert_object)
 
         html = self._email_html(alert_object, institution_name, real_email, demo_email, show_real)
@@ -1744,17 +2078,18 @@ officer is sending this alert!!
                 server.send_message(msg)
             
             self.emails_sent_this_hour += 1
-            self._log(f"email sent to demo recipient: {demo_email} (count: {self.emails_sent_this_hour}/3)")
+            self._log(f"email sent to recipient: {target_email} (count: {self.emails_sent_this_hour}/3)")
             return "sent"
         except Exception as exc:
             self._log(f"email failed: {exc}")
             return f"failed: {exc}"
 
-    def send_alert_email(self, incident: dict[str, Any], screenshot: str | None = None) -> bool:
+    def send_alert_email(self, incident: dict[str, Any], screenshot: str | None = None, recipient_email: str | None = None) -> bool:
         try:
             gmail = os.getenv("GMAIL_ADDRESS", "")
             password = os.getenv("GMAIL_PASSWORD", "")
             demo_email = os.getenv("DEMO_EMAIL", gmail)
+            target_email = str(recipient_email or demo_email or gmail).strip()
 
             if not gmail or not password:
                 print("[email] credentials missing")
@@ -1763,7 +2098,7 @@ officer is sending this alert!!
             feature = incident.get("incident_type", "Public Safety Incident")
             severity = int(incident.get("severity_score", 7) or 7)
             location = incident.get("location", "Unknown Location")
-            description = incident.get("description") or incident.get("groq_description", "")
+            description = incident.get("description") or incident.get("gemini_description", "") or incident.get("groq_description", "")
             action = incident.get("action") or incident.get("recommended_action", "")
             timestamp = datetime.now().strftime("%d %B %Y at %I:%M %p IST")
 
@@ -1778,7 +2113,7 @@ officer is sending this alert!!
             primary_recipient = self._select_primary_authority(incident, recipients)
 
             primary_email = str(primary_recipient.get("email", "")).strip()
-            recipient_emails = [demo_email] if demo_email else [gmail]
+            recipient_emails = [target_email] if target_email else [gmail]
 
             incident["primary_authority"] = primary_recipient
             incident["nearest_authority"] = primary_recipient
@@ -2128,7 +2463,7 @@ Unified: <b>{en.get('unified', '112')}</b>
             f"*Severity:* {alert_object.get('severity_score', 0)}/10\n"
             f"*Nearest Authority:* {nearest.get('name', 'N/A')}\n"
             f"*Phone:* {nearest.get('phone', 'N/A')}\n\n"
-            f"*AI Analysis:* _{alert_object.get('groq_description', 'N/A')[:200]}_"
+            f"*AI Analysis:* _{alert_object.get('gemini_description', alert_object.get('groq_description', 'N/A'))[:200]}_"
         )
 
         try:
@@ -2166,35 +2501,29 @@ Unified: <b>{en.get('unified', '112')}</b>
             return "failed: DEMO_PHONE missing"
         
         try:
-            from groq import Groq
+            import google.generativeai as genai
             import os
             import re
-            client = Groq(
-                api_key=os.getenv('GROQ_API_KEY')
-            )
-            resp = client.chat.completions.create(
-                model="llama3-8b-8192",
-                messages=[{
-                    "role": "user",
-                    "content": (
-                        f"Write a 3 sentence "
-                        f"emergency call script. "
-                        f"Incident: {alert_object.get('incident_type')}. "
-                        f"Location: {alert_object.get('location')}. "
-                        f"Severity: {alert_object.get('severity_score')}/10. "
-                        f"Start with Hello this is Protego. "
-                        f"End with Please respond immediately. "
-                        f"No special characters."
-                    )
-                }],
-                max_tokens=100,
-                temperature=0.3
-            )
-            script = re.sub(
-                r'[^\w\s.,!?-]',
-                '',
-                resp.choices[0].message.content.strip()
-            )
+            gemini_key = os.getenv('GEMINI_API_KEY', '')
+            if gemini_key:
+                genai.configure(api_key=gemini_key)
+                gemini_model = genai.GenerativeModel('gemini-2.5-flash')
+                resp = gemini_model.generate_content(
+                    f"Write a 3 sentence emergency call script. "
+                    f"Incident: {alert_object.get('incident_type')}. "
+                    f"Location: {alert_object.get('location')}. "
+                    f"Severity: {alert_object.get('severity_score')}/10. "
+                    f"Start with Hello this is Protego. "
+                    f"End with Please respond immediately. "
+                    f"No special characters."
+                )
+                script = re.sub(
+                    r'[^\w\s.,!?-]',
+                    '',
+                    (resp.text or "").strip()
+                )
+            else:
+                raise ValueError("No Gemini key")
         except Exception:
             script = (
                 f"Hello this is Protego AI. "
@@ -2241,7 +2570,7 @@ Unified: <b>{en.get('unified', '112')}</b>
                 "latitude": alert_object.get("camera_latitude", alert_object.get("latitude")),
                 "longitude": alert_object.get("camera_longitude", alert_object.get("longitude")),
             },
-            "description": alert_object.get("groq_description"),
+            "description": alert_object.get("gemini_description") or alert_object.get("groq_description"),
             "contact": {"demo_phone": self._get_demo_config_from_db().get("demo_phone") or self.demo_phone},
         }
 
@@ -2260,7 +2589,7 @@ Unified: <b>{en.get('unified', '112')}</b>
             incident = alert_object.get("incident_type", "Unknown Incident")
             location = alert_object.get("location", "Unknown Location")
             severity = int(alert_object.get("severity_score", 0))
-            description = str(alert_object.get("groq_description") or "")[:200]
+            description = str(alert_object.get("gemini_description") or alert_object.get("groq_description") or "")[:200]
             nearest = alert_object.get("nearest_authority") or {}
             authority_name = nearest.get("name", "Emergency Services")
 
@@ -2278,10 +2607,11 @@ Unified: <b>{en.get('unified', '112')}</b>
             mp3_buffer.seek(0)
 
             async def _send_voice() -> None:
+                target_chat_id = self.session_telegram_chat_id or self.telegram_chat_id
                 bot = Bot(token=self.telegram_token)
                 async with bot:
                     await bot.send_voice(
-                        chat_id=self.telegram_chat_id,
+                        chat_id=target_chat_id,
                         voice=mp3_buffer,
                         caption=f"🔊 Voice Alert: {incident} at {location}",
                     )
@@ -2296,45 +2626,23 @@ Unified: <b>{en.get('unified', '112')}</b>
     def send_telegram_voice_summary(self, incident: dict[str, Any]) -> None:
         try:
             import tempfile
-            from groq import Groq
-            import telegram
-            import pyttsx3
+            import google.generativeai as genai
+            genai.configure(api_key=os.getenv("GEMINI_API_KEY", ""))
+            gemini_model = genai.GenerativeModel("gemini-2.5-flash")
 
-            feature = incident.get("incident_type", "incident")
-            severity = incident.get("severity_score", 7)
-            location = incident.get("location", "Unknown")
-            description = incident.get("description") or incident.get("groq_description", "")
+            feature = incident.get("incident_type", "Incident")
+            severity = int(incident.get("severity_score", 7) or 7)
+            location = incident.get("location", "Unknown Location")
+            description = incident.get("description") or incident.get("gemini_description", "") or incident.get("groq_description", "")
 
-            client = Groq(api_key=os.getenv("GROQ_API_KEY", ""))
-            resp = client.chat.completions.create(
-                model="meta-llama/llama-4-scout-17b-16e-instruct",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": f"""
-Write a short voice alert script
-to be spoken by an AI safety system.
-
-Incident: {feature}
-Severity: {severity}/10
-Location: {location}
-Details: {description}
-
-Rules:
-- Max 4 sentences
-- Speak clearly and urgently
-- No special characters or emojis
-- Natural spoken English
-- End with emergency number 112
-- Sound like a real emergency alert
-""",
-                    }
-                ],
-                max_tokens=150,
-                temperature=0.6,
+            gemini_resp = gemini_model.generate_content(
+                f"Write a short voice alert script to be spoken by an AI safety system.\n"
+                f"Incident: {feature}\nSeverity: {severity}/10\nLocation: {location}\nDetails: {description}\n\n"
+                f"Rules:\n- Max 4 sentences\n- Speak clearly and urgently\n- No special characters or emojis\n"
+                f"- Natural spoken English\n- End with emergency number 112\n- Sound like a real emergency alert"
             )
 
-            script = (resp.choices[0].message.content or "").strip()
+            script = (gemini_resp.text or "").strip()
             script = re.sub(r"[^\w\s.,!?-]", "", script)
             print(f"[voice] script: {script}")
 
@@ -2356,11 +2664,12 @@ Rules:
             engine.runAndWait()
 
             async def _send() -> None:
+                target_chat_id = self.session_telegram_chat_id or self.telegram_chat_id
                 bot = telegram.Bot(token=self.telegram_token)
                 async with bot:
                     with open(tmp_path, "rb") as voice_file:
                         await bot.send_voice(
-                            chat_id=self.telegram_chat_id,
+                            chat_id=target_chat_id,
                             voice=voice_file,
                             caption=f"🔊 Voice Alert: {feature} · Severity {severity}/10",
                         )
@@ -2377,11 +2686,14 @@ Rules:
 
         if latitude and longitude:
             nearby = self.find_nearby_with_overpass(latitude, longitude)
+            nearby_services = self.get_nearby_emergency_services(latitude, longitude)
         else:
             nearby = self._emergency_fallback()
+            nearby_services = []
         self._augment_with_city_referral_hospitals(alert_object, nearby, force_include=False)
 
         alert_object["nearby_authorities"] = nearby
+        alert_object["nearby_services"] = nearby_services
         selected_authorities = self._pick_best_authorities(alert_object, nearby)
         primary = self._select_primary_authority(alert_object, selected_authorities)
         alert_object["primary_authority"] = primary or {}
@@ -2407,6 +2719,19 @@ Rules:
             ),
         }
         alert_object["combined_authorities"] = combined
+
+        demo_email = str(self._get_demo_config_from_db().get("demo_email") or self.demo_email).strip() or self.gmail_address
+        email_targets: list[str] = []
+        if self.session_email:
+            email_targets.append(self.session_email)
+        else:
+            if demo_email:
+                email_targets.append(demo_email)
+            for contact in self.contacts_cache:
+                email = str(contact.get("email", "")).strip()
+                if email and email not in email_targets:
+                    email_targets.append(email)
+        alert_object["email_sent_to"] = []
 
         city_auth_cache: dict[str, Any] = {}
         for value in getattr(self, "_city_auth_cache", {}).values():
@@ -2443,7 +2768,12 @@ Rules:
             results["whatsapp"] = self.send_whatsapp_twilio(alert_object)
 
         def _email() -> None:
-            results["email"] = "sent" if self.send_alert_email(alert_object, screenshot_base64) else "failed"
+            sent_to: list[str] = []
+            for target_email in email_targets:
+                if self.send_alert_email(alert_object, screenshot_base64, recipient_email=target_email):
+                    sent_to.append(target_email)
+            alert_object["email_sent_to"] = sent_to
+            results["email"] = "sent" if sent_to else "failed"
 
         threads = [
             threading.Thread(target=_telegram, daemon=True),
@@ -2466,4 +2796,18 @@ Rules:
         # Delivery logging to console and Supabase via incident channel fields at save time.
         self._log(f"delivery status: {results}")
         alert_object["alert_channels"] = results
+
+        popup = {
+            "id": f"popup-{int(time.time() * 1000)}",
+            "incident_type": str(alert_object.get("incident_type", "Incident")),
+            "severity": int(alert_object.get("severity_score", 0) or 0),
+            "description": str(alert_object.get("gemini_description") or alert_object.get("groq_description") or alert_object.get("description") or ""),
+            "timestamp": str(alert_object.get("timestamp") or datetime.now(timezone.utc).isoformat()),
+            "nearby_services": nearby_services,
+            "email_sent_to": list(alert_object.get("email_sent_to", []) or []),
+        }
+        with self._popup_lock:
+            self.pending_popups.append(popup)
+            self.pending_popups = self.pending_popups[-20:]
+        alert_object["pending_popup"] = popup
         return alert_object

@@ -3,7 +3,7 @@ import {
   Video, MapPin, ShieldAlert, Siren, Play, Pause, Maximize2,
   Clock, Target, Radio, Wifi, Zap, Cpu, Mail, MessageCircle,
   Smartphone, MoreVertical, Loader2, CheckCircle, XCircle,
-  Camera, Youtube, ChevronRight
+  Camera, Youtube, ChevronRight, ChevronLeft
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -11,8 +11,13 @@ import { cn } from "@/lib/utils";
 import { motion, AnimatePresence } from "framer-motion";
 import { io } from "socket.io-client";
 import { useToast } from "@/components/ui/use-toast";
+import AdminSetupModal from "@/components/AdminSetupModal";
+import EmergencyCallOverlay from "@/components/EmergencyCallOverlay";
+import { EmergencyAlertModal } from "../../components/EmergencyAlertModal";
+import { useEmergencySpeech } from "@/hooks/useEmergencySpeech";
 
 const API = "http://127.0.0.1:5000";
+const VOICE_AUTO_DELAY_MS = 120000;
 
 interface Detection {
   label: string; confidence: number;
@@ -22,10 +27,11 @@ interface Detection {
 
 interface Alert {
   id: string; incident_type: string; feature_name: string;
-  location: string; severity_score: number; groq_description: string;
+  location: string; severity_score: number; gemini_description: string;
+  description?: string;
   authority_alerted: string[]; vehicle_plates?: string[];
   screenshot: string; timestamp: string;
-  alert_channels: { telegram: "sent" | "failed"; sms: "sent" | "failed"; email: "sent" | "failed"; };
+  alert_channels?: { telegram: "sent" | "failed"; sms: "sent" | "failed"; email: "sent" | "failed"; };
   crowd_density?: number; escape_direction?: string;
   nearby_authorities?: {
     hospital?: Array<{ name: string; distance_km: number; phone: string }>;
@@ -40,7 +46,7 @@ interface Stats {
   authorities_contacted: number; active_cameras: number;
 }
 
-interface GroqThreat {
+interface GeminiThreat {
   feature?: string;
   type: string;
   description: string;
@@ -50,14 +56,14 @@ interface GroqThreat {
   evidence?: string;
 }
 
-interface GroqAnalysis {
+interface GeminiAnalysis {
   scene: string;
   people_count: number;
   vehicles_count: number;
-  threats: GroqThreat[];
+  threats: GeminiThreat[];
   safe: boolean;
   timestamp: string;
-  groq_summary?: string;
+  gemini_reasoning?: string;
 }
 
 type CameraTab = "webcam" | "droidcam" | "youtube" | "rtsp";
@@ -292,6 +298,20 @@ function LocationPanel({ onLocationSet }: { onLocationSet: (loc: LocationObj) =>
   );
 }
 
+const TooltipIcon = ({ icon: Icon, status, label }: { icon: React.ElementType, status: "sent" | "failed", label: string }) => (
+  <div className="relative group">
+    <Icon
+      className={cn(
+        "w-4 h-4",
+        status === "sent" ? "text-green-400" : "text-red-400"
+      )}
+    />
+    <div className="absolute bottom-full mb-2 left-1/2 -translate-x-1/2 bg-black text-white text-xs rounded py-1 px-2 opacity-0 group-hover:opacity-100 transition-opacity duration-300 whitespace-nowrap">
+      {label}: {status}
+    </div>
+  </div>
+);
+
 // ── NearbyAuthorities ─────────────────────────────────────────────────────
 function NearbyAuthorities({ nearby }: { nearby?: Alert["nearby_authorities"] }) {
   if (!nearby) return null;
@@ -452,7 +472,7 @@ function CityAuthoritiesPreview({ cityAuth, cityAuthLoading }: { cityAuth: CityA
             🔍 Searching major authorities...
           </p>
           <p style={{ color: "#444", fontSize: "10px", margin: 0 }}>
-            Using Tavily + Groq AI
+            Using Tavily + Gemini AI
           </p>
         </div>
       )}
@@ -575,15 +595,15 @@ function CityAuthoritiesPreview({ cityAuth, cityAuthLoading }: { cityAuth: CityA
   );
 }
 
-function GroqSidebar({ groqData, groqLog }: { groqData: GroqAnalysis | null; groqLog: GroqAnalysis[] }) {
-  const isThreat = !!groqData && !groqData.safe && (groqData.threats?.length || 0) > 0;
+function GeminiSidebar({ geminiData, geminiLog }: { geminiData: GeminiAnalysis | null; geminiLog: GeminiAnalysis[] }) {
+  const isThreat = !!geminiData && !geminiData.safe && (geminiData.threats?.length || 0) > 0;
 
   return (
     <div style={{
       width: "300px",
       minWidth: "300px",
       background: "#0d0d1a",
-      border: `1px solid ${isThreat ? "#ef4444" : "#4cc9f0"}`,
+      border: `1px solid ${isThreat ? "#ef4444" : "#7c3aed"}`,
       borderRadius: "12px",
       padding: "16px",
       height: "calc(100vh - 120px)",
@@ -601,23 +621,23 @@ function GroqSidebar({ groqData, groqLog }: { groqData: GroqAnalysis | null; gro
       }}>
         <span style={{
           fontSize: "18px",
-          animation: groqData ? "none" : "pulse 1.5s infinite"
-        }}>🧠</span>
+          animation: geminiData ? "none" : "pulse 1.5s infinite"
+        }}>♊</span>
         <div>
           <p style={{
-            color: "#4cc9f0",
+            color: "#a78bfa",
             fontWeight: "bold",
             margin: 0,
             fontSize: "13px"
           }}>
-            GROQ VISION BRAIN
+            GEMINI 2.5 FLASH BRAIN
           </p>
           <p style={{
             color: "#666",
             margin: 0,
             fontSize: "10px"
           }}>
-            {groqData ? `Last: ${groqData.timestamp}` : "Waiting for video..."}
+            {geminiData ? `Last: ${geminiData.timestamp}` : "Waiting for video..."}
           </p>
         </div>
         <div style={{
@@ -625,12 +645,12 @@ function GroqSidebar({ groqData, groqLog }: { groqData: GroqAnalysis | null; gro
           width: "8px",
           height: "8px",
           borderRadius: "50%",
-          background: isThreat ? "#ef4444" : groqData ? "#4ade80" : "#666",
-          boxShadow: isThreat ? "0 0 8px #ef4444" : groqData ? "0 0 8px #4ade80" : "none"
+          background: isThreat ? "#ef4444" : geminiData ? "#4ade80" : "#666",
+          boxShadow: isThreat ? "0 0 8px #ef4444" : geminiData ? "0 0 8px #4ade80" : "none"
         }} />
       </div>
 
-      {!groqData && (
+      {!geminiData && (
         <div style={{
           textAlign: "center",
           padding: "40px 20px",
@@ -646,12 +666,12 @@ function GroqSidebar({ groqData, groqLog }: { groqData: GroqAnalysis | null; gro
             fontSize: "13px",
             lineHeight: "1.6"
           }}>
-            Load a YouTube video to start Groq Vision analysis...
+            Load a YouTube video to start Gemini multimodal analysis...
           </p>
         </div>
       )}
 
-      {groqData && (
+      {geminiData && (
         <>
           <div style={{
             background: isThreat ? "rgba(239,68,68,0.1)" : "rgba(74,222,128,0.1)",
@@ -676,7 +696,7 @@ function GroqSidebar({ groqData, groqLog }: { groqData: GroqAnalysis | null; gro
               margin: "0 0 8px",
               lineHeight: "1.5"
             }}>
-              {groqData.scene}
+              {geminiData.scene}
             </p>
             <div style={{
               display: "flex",
@@ -686,18 +706,18 @@ function GroqSidebar({ groqData, groqLog }: { groqData: GroqAnalysis | null; gro
                 color: "#888",
                 fontSize: "11px"
               }}>
-                👥 {groqData.people_count} people
+                👥 {geminiData.people_count} people
               </span>
               <span style={{
                 color: "#888",
                 fontSize: "11px"
               }}>
-                🚗 {groqData.vehicles_count} vehicles
+                🚗 {geminiData.vehicles_count} vehicles
               </span>
             </div>
           </div>
 
-          {isThreat && groqData.threats.map((t, i) => (
+          {isThreat && geminiData.threats.map((t, i) => (
             <div key={i} style={{
               background: "rgba(239,68,68,0.08)",
               border: "1px solid #ef4444",
@@ -757,30 +777,31 @@ function GroqSidebar({ groqData, groqLog }: { groqData: GroqAnalysis | null; gro
             </div>
           ))}
 
-          {groqData.groq_summary && (
+          {geminiData.gemini_reasoning && (
             <div style={{
-              background: "rgba(76,201,240,0.05)",
-              border: "1px solid #1a3a4a",
+              background: "rgba(124,58,237,0.05)",
+              border: "1px solid #4ade80",
               borderRadius: "8px",
               padding: "10px",
               marginBottom: "12px"
             }}>
               <p style={{
-                color: "#4cc9f0",
+                color: "#a78bfa",
                 fontSize: "10px",
                 fontWeight: "bold",
                 margin: "0 0 4px",
                 textTransform: "uppercase"
               }}>
-                AI Summary
+                Gemini Reasoning (Thought)
               </p>
               <p style={{
                 color: "#888",
                 fontSize: "11px",
                 margin: 0,
-                lineHeight: "1.5"
+                lineHeight: "1.5",
+                fontStyle: "italic"
               }}>
-                {groqData.groq_summary}
+                "{geminiData.gemini_reasoning}"
               </p>
             </div>
           )}
@@ -798,7 +819,7 @@ function GroqSidebar({ groqData, groqLog }: { groqData: GroqAnalysis | null; gro
             }}>
               Analysis Log
             </p>
-            {groqLog.map((log, i) => (
+            {geminiLog.map((log, i) => (
               <div key={i} style={{
                 display: "flex",
                 gap: "6px",
@@ -1105,29 +1126,154 @@ function YoutubeTab({
 
 // ── Main Component ─────────────────────────────────────────────────────────
 export default function LiveMonitor() {
-  const [alerts, setAlerts] = useState<Alert[]>([]);
+  const { toast } = useToast();
+  const [socket, setSocket] = useState<any>(null);
+  const [isSocketConnected, setIsSocketConnected] = useState(false);
+  const [isWebcamActive, setIsWebcamActive] = useState(false);
+  const [isManualStream, setIsManualStream] = useState(false);
+  const [streamError, setStreamError] = useState<string | null>(null);
+  const [detections, setDetections] = useState<Detection[]>([]);
+  const [latestAlert, setLatestAlert] = useState<Alert | null>(null);
+  const [alertHistory, setAlertHistory] = useState<Alert[]>([]);
+  const [stats, setStats] = useState<Stats | null>(null);
+  const [geminiAnalysis, setGeminiAnalysis] = useState<GeminiAnalysis | null>(null);
+  const [isFullScreen, setIsFullScreen] = useState(false);
   const [activeTab, setActiveTab] = useState<CameraTab>("webcam");
-  const [isLive, setIsLive] = useState(true);
-  const [stats, setStats] = useState<Stats>({ total_alerts: 0, high_severity: 0, authorities_contacted: 0, active_cameras: 0 });
-  const [cameraStatus, setCameraStatus] = useState<string>("connecting");
-  const [cameraName, setCameraName] = useState<string>("NODE 04");
-  const [activeCamera, setActiveCamera] = useState<CameraTab | null>(null);
+  const [youtubeUrl, setYoutubeUrl] = useState("");
   const [rtspUrl, setRtspUrl] = useState("");
+  const [isStartingStream, setIsStartingStream] = useState(false);
+  const [location, setLocation] = useState<LocationObj | null>(null);
+  const [isLocationLoading, setIsLocationLoading] = useState(true);
+  const [isSetupModalOpen, setIsSetupModalOpen] = useState(false);
+  const [isEmergencyCallOpen, setIsEmergencyCallOpen] = useState(false);
   const [nearbyAuthorities, setNearbyAuthorities] = useState<NearbyAuthoritiesData>({});
-  const [cityAuth, setCityAuth] = useState<CityAuthoritiesData | null>(null);
-  const [cityAuthLoading, setCityAuthLoading] = useState(false);
+  const [isFetchingTavily, setIsFetchingTavily] = useState(false);
+  const [alertModalOpen, setAlertModalOpen] = useState(false);
+  const [currentAlert, setCurrentAlert] = useState<Alert | null>(null);
+  const [activeLocationName, setActiveLocationName] = useState("Unknown");
   const [tavilyData, setTavilyData] = useState<TavilyAuthoritiesData | null>(null);
   const [tavilyLoading, setTavilyLoading] = useState(false);
-  const [activeLocationName, setActiveLocationName] = useState<string>("Unknown");
-  const [groqData, setGroqData] = useState<GroqAnalysis | null>(null);
-  const [groqLog, setGroqLog] = useState<GroqAnalysis[]>([]);
   const [userLocation, setUserLocation] = useState<LocationObj | null>(null);
+  const [cityAuth, setCityAuth] = useState<CityAuthoritiesData | null>(null);
+  const [cityAuthLoading, setCityAuthLoading] = useState(false);
+  const [cameraStatus, setCameraStatus] = useState("disconnected");
+  const [cameraName, setCameraName] = useState("N/A");
+  const [alerts, setAlerts] = useState<Alert[]>([]);
+  const [isAlertsConfigured, setIsAlertsConfigured] = useState(false);
+  const [activeCallIncident, setActiveCallIncident] = useState<{ incident_type: string; location: string; severity: number } | null>(null);
+  const [isCallOverlayOpen, setIsCallOverlayOpen] = useState(false);
+  const [geminiData, setGeminiData] = useState<GeminiAnalysis | null>(null);
+  const [geminiLog, setGeminiLog] = useState<GeminiAnalysis[]>([]);
+  const [activeCamera, setActiveCamera] = useState<CameraTab | null>(null);
+  const [voiceAlertText, setVoiceAlertText] = useState("");
+  const [isVoicePlaying, setIsVoicePlaying] = useState(false);
 
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const fullScreenRef = useRef<HTMLDivElement>(null);
+  const isLiveRef = useRef(true);
   const imgRef = useRef<HTMLImageElement>(null);
-  const isLiveRef = useRef(isLive);
-  isLiveRef.current = isLive;
+  const voicedEmailAlertIdsRef = useRef<Set<string>>(new Set());
+  const scheduledVoiceAlertIdsRef = useRef<Set<string>>(new Set());
+  const delayedVoiceTimeoutsRef = useRef<Record<string, number>>({});
 
-  const { toast } = useToast();
+  const { speak } = useEmergencySpeech();
+
+  const playBackendVoiceAlert = useCallback(async (text: string) => {
+    try {
+      const res = await fetch(`${API}/api/voice/emergency`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+
+      if (!res.ok) {
+        throw new Error(`voice fallback failed: ${res.status}`);
+      }
+
+      const audioBlob = await res.blob();
+      const audioUrl = URL.createObjectURL(audioBlob);
+      const audio = new Audio(audioUrl);
+      audio.preload = "auto";
+      audio.play().catch(() => null);
+      audio.onended = () => URL.revokeObjectURL(audioUrl);
+      audio.onerror = () => URL.revokeObjectURL(audioUrl);
+    } catch (error) {
+      console.error("Backend voice fallback failed", error);
+    }
+  }, []);
+
+  const buildVoiceAlertText = useCallback((alertData: Alert) => {
+    const location = alertData.location || "Unknown";
+    const time = alertData.timestamp
+      ? new Date(alertData.timestamp).toLocaleTimeString()
+      : new Date().toLocaleTimeString();
+    const incidentSummary = (alertData.gemini_description || alertData.description || alertData.feature_name || alertData.incident_type || "Incident detected").trim();
+
+    return [
+      "Due to trial limitations of Twilio, real-time phone calls to unverified numbers are restricted.",
+      "However, we have implemented a real-time voice alert system that replicates emergency calls instantly.",
+      "Emergency Alert.",
+      `What was detected: ${incidentSummary}.`,
+      `Location: ${location}.`,
+      `Time: ${time}.`,
+      "Immediate attention is required. Please respond promptly.",
+    ].join(" ");
+  }, []);
+
+  const playVoiceMessage = useCallback(async (message: string) => {
+    setIsVoicePlaying(true);
+    try {
+      const browserSpoke = speak({ text: message });
+      if (!browserSpoke) {
+        await playBackendVoiceAlert(message);
+      }
+    } finally {
+      window.setTimeout(() => setIsVoicePlaying(false), 3500);
+    }
+  }, [playBackendVoiceAlert, speak]);
+
+  const openLiveAlertPopup = useCallback((alertData: Alert) => {
+    const uniqueId = String(alertData.id || `${alertData.incident_type}-${alertData.timestamp || Date.now()}`);
+    const message = buildVoiceAlertText(alertData);
+
+    if (!scheduledVoiceAlertIdsRef.current.has(uniqueId)) {
+      scheduledVoiceAlertIdsRef.current.add(uniqueId);
+      delayedVoiceTimeoutsRef.current[uniqueId] = window.setTimeout(() => {
+        void playVoiceMessage(message);
+      }, VOICE_AUTO_DELAY_MS);
+    }
+
+    if (voicedEmailAlertIdsRef.current.has(uniqueId)) {
+      // Keep the popup open for the latest detection, but don't duplicate voice text state.
+      setCurrentAlert(alertData);
+      setAlertModalOpen(true);
+      setVoiceAlertText(message);
+      return;
+    }
+
+    voicedEmailAlertIdsRef.current.add(uniqueId);
+    setCurrentAlert(alertData);
+    setAlertModalOpen(true);
+    setVoiceAlertText(message);
+  }, [buildVoiceAlertText, playVoiceMessage]);
+
+  const handlePlayVoiceAlert = useCallback(async () => {
+    if (!currentAlert) return;
+
+    const message = voiceAlertText || buildVoiceAlertText(currentAlert);
+    await playVoiceMessage(message);
+  }, [buildVoiceAlertText, currentAlert, playVoiceMessage, voiceAlertText]);
+
+  useEffect(() => {
+    return () => {
+      Object.values(delayedVoiceTimeoutsRef.current).forEach((timeoutId) => {
+        window.clearTimeout(timeoutId);
+      });
+      delayedVoiceTimeoutsRef.current = {};
+    };
+  }, []);
 
   const fetchAuthorities = useCallback(async () => {
     try {
@@ -1155,6 +1301,66 @@ export default function LiveMonitor() {
     }
   }, []);
 
+  useEffect(() => {
+    if ("geolocation" in navigator) {
+      navigator.geolocation.getCurrentPosition(async (position) => {
+        const { latitude, longitude } = position.coords;
+        try {
+          const res = await fetch(`${API}/api/location/update`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ latitude, longitude })
+          });
+          const data = await res.json();
+          if (data.success) {
+            setActiveLocationName(data.data.location_name);
+            await fetchAuthorities();
+            void loadMajorAuthorities();
+          }
+        } catch (err) {
+          console.error("Failed to update GPS location", err);
+        }
+      }, (error) => {
+        console.warn("Geolocation blocked or failed", error);
+        fetchAuthorities(); // fallback to current server location
+        void loadMajorAuthorities();
+      });
+    } else {
+      fetchAuthorities();
+      void loadMajorAuthorities();
+    }
+  }, [fetchAuthorities, loadMajorAuthorities]);
+
+  useEffect(() => {
+    if ("geolocation" in navigator) {
+      navigator.geolocation.getCurrentPosition(async (position) => {
+        const { latitude, longitude } = position.coords;
+        try {
+          const res = await fetch(`${API}/api/location/update`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ latitude, longitude })
+          });
+          const data = await res.json();
+          if (data.success) {
+            setActiveLocationName(data.data.location_name);
+            await fetchAuthorities();
+            void loadMajorAuthorities();
+          }
+        } catch (err) {
+          console.error("Failed to update GPS location", err);
+        }
+      }, (error) => {
+        console.warn("Geolocation blocked or failed", error);
+        fetchAuthorities(); // fallback to current server location
+        void loadMajorAuthorities();
+      });
+    } else {
+      fetchAuthorities();
+      void loadMajorAuthorities();
+    }
+  }, [fetchAuthorities, loadMajorAuthorities]);
+
   const handleLocationSet = useCallback(async (loc: LocationObj) => {
     setUserLocation(loc);
     setCityAuth(null);
@@ -1176,7 +1382,7 @@ export default function LiveMonitor() {
 
     fetch(`${API}/api/location/search-authorities`, {
       method: "POST",
-    }).catch(() => {});
+    }).catch(() => { });
 
     // 2. Browser GPS Collection
     if ("geolocation" in navigator) {
@@ -1186,7 +1392,7 @@ export default function LiveMonitor() {
           const res = await fetch(`${API}/api/location/update`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ latitude, longitude, location_name: "Browser GPS" })
+            body: JSON.stringify({ latitude, longitude })
           });
           const data = await res.json();
           if (data.success) {
@@ -1232,6 +1438,17 @@ export default function LiveMonitor() {
         imgRef.current.src = `data:image/jpeg;base64,${b64}`;
       }
     });
+    socket.on("new_alert", (data: Alert) => {
+      console.log("New alert received:", data);
+      setLatestAlert(data);
+      setAlertHistory((prev) => [data, ...prev.slice(0, 4)]);
+      openLiveAlertPopup(data);
+      toast({
+        title: "🚨 New High-Severity Alert!",
+        description: `${data.incident_type} detected at ${data.location}.`,
+        variant: "destructive",
+      });
+    });
     socket.on("alert", (alert: Alert) => {
       setAlerts(prev => [alert, ...prev].slice(0, 50));
       setStats(prev => ({
@@ -1239,18 +1456,31 @@ export default function LiveMonitor() {
         high_severity: alert.severity_score >= 7 ? prev.high_severity + 1 : prev.high_severity,
         authorities_contacted: prev.authorities_contacted + (alert.authority_alerted?.length ? 1 : 0),
       }));
+
+      // Trigger Call Overlay for high severity threats ONLY if alerts are set up
+      if (alert.severity_score >= 7 && isAlertsConfigured) {
+        setActiveCallIncident({
+          incident_type: alert.incident_type,
+          location: alert.location || activeLocationName || "Unknown Location",
+          severity: alert.severity_score
+        });
+        setIsCallOverlayOpen(true);
+      }
+    });
+    socket.on("stats_update", (data: Stats) => {
+      setStats(data);
     });
     socket.on("camera_status", (data: any) => {
       setCameraStatus(data.status);
       if (data.camera_name || data.name) setCameraName(data.camera_name || data.name);
     });
-    socket.on("groq_analysis", (data: GroqAnalysis) => {
-      setGroqData(data);
-      setGroqLog(prev => [data, ...prev.slice(0, 29)]);
+    socket.on("gemini_analysis", (data: GeminiAnalysis) => {
+      setGeminiData(data);
+      setGeminiLog(prev => [data, ...prev.slice(0, 29)]);
     });
-    socket.on("groq_reset", () => {
-      setGroqData(null);
-      setGroqLog([]);
+    socket.on("gemini_reset", () => {
+      setGeminiData(null);
+      setGeminiLog([]);
     });
     socket.on("location_updated", (location: LocationObj & { location_name?: string }) => {
       setUserLocation(location);
@@ -1277,7 +1507,7 @@ export default function LiveMonitor() {
       socket.off("city_authorities_loading");
       socket.disconnect();
     };
-  }, [fetchAuthorities, loadMajorAuthorities, toast]);
+  }, [fetchAuthorities, loadMajorAuthorities, toast, activeLocationName, isAlertsConfigured]);
 
   // Activate webcam
   const activateWebcam = async () => {
@@ -1337,22 +1567,22 @@ export default function LiveMonitor() {
         }),
       });
       const data = await res.json();
-      if (!res.ok) { 
-        toast({ 
-          title: "Stream Loading Failed", 
-          description: data?.error || data?.message || "YouTube stream could not be processed. Please check the URL.", 
-          variant: "destructive" 
-        }); 
-        setCameraStatus("disconnected"); 
-        return; 
+      if (!res.ok) {
+        toast({
+          title: "Stream Loading Failed",
+          description: data?.error || data?.message || "YouTube stream could not be processed. Please check the URL.",
+          variant: "destructive"
+        });
+        setCameraStatus("disconnected");
+        return;
       }
       setActiveCamera("youtube");
       setActiveLocationName(locationName);
       await fetchAuthorities();
-      toast({ 
-        title: "YouTube Stream Initialized", 
-        description: "yt-dlp is extracting the feed. Please wait 10-15 seconds for playback.", 
-        duration: 8000 
+      toast({
+        title: "YouTube Stream Initialized",
+        description: "yt-dlp is extracting the feed. Please wait 10-15 seconds for playback.",
+        duration: 8000
       });
     } catch (e) {
       toast({ title: "Stream error", variant: "destructive" });
@@ -1398,41 +1628,13 @@ export default function LiveMonitor() {
   ];
 
   return (
-    <div className="flex flex-col h-full gap-8">
-      {/* Header */}
-      <div className="flex flex-col md:flex-row items-center justify-between gap-6">
-        <div className="flex items-center gap-4">
-          {/* Camera source tabs */}
-          <div className="flex bg-white/[0.03] p-1.5 rounded-[1.25rem] border border-white/[0.05] ring-1 ring-white/[0.02]">
-            {TABS.map(tab => (
-              <Button key={tab.id} variant="ghost" size="sm"
-                className={cn("text-[10px] font-black uppercase tracking-[0.15em] px-5 h-9 transition-all rounded-xl",
-                  activeTab === tab.id ? "bg-white/[0.08] text-white shadow-xl" : "text-white/20 hover:text-white")}
-                onClick={() => setActiveTab(tab.id)}>
-                {tab.label}
-              </Button>
-            ))}
-            <button
-              onClick={() => setActiveTab("rtsp")}
-              style={{
-                height: "36px",
-                borderRadius: "12px",
-                border: "1px solid rgba(76,201,240,0.35)",
-                padding: "0 16px",
-                fontSize: "10px",
-                fontWeight: 800,
-                letterSpacing: "0.15em",
-                textTransform: "uppercase",
-                cursor: "pointer",
-                marginLeft: "6px",
-                background: activeTab === "rtsp" ? "#4cc9f0" : "transparent",
-                color: activeTab === "rtsp" ? "#000" : "#4cc9f0",
-              }}
-            >
-              📡 RTSP
-            </button>
-          </div>
-
+    <div className="flex flex-col gap-8 pb-20">
+      <div className="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-5">
+        <div>
+          <h1 className="text-3xl font-black tracking-tighter uppercase mb-2">Live Monitor</h1>
+          <p className="text-xs text-white/40 font-medium uppercase tracking-widest">Real-time camera surveillance, AI detections, and emergency dispatch</p>
+        </div>
+        <div className="flex flex-wrap items-center gap-3">
           <div className={cn("flex items-center gap-3 px-4 py-2.5 border rounded-2xl transition-colors",
             cameraStatus === "connected" ? "bg-primary/20 border-primary/20" :
               cameraStatus === "connecting" ? "bg-orange-500/20 border-orange-500/20" : "bg-red-900/40 border-red-500/40")}>
@@ -1445,90 +1647,124 @@ export default function LiveMonitor() {
                 cameraStatus === "connecting" ? "CONNECTING..." : "DISCONNECTED"}
             </span>
           </div>
+          <Button
+            onClick={() => setIsSetupModalOpen(true)}
+            variant="outline"
+            className="rounded-2xl border-white/10 bg-white/5 hover:bg-blue-600/20 hover:border-blue-500/50 text-[10px] font-black uppercase tracking-widest gap-2"
+          >
+            <Smartphone size={14} className="text-blue-400" />
+            Setup Alerts
+          </Button>
         </div>
-
-        <Button size="sm" onClick={() => document.querySelector<HTMLElement>('[data-live-feed]')?.requestFullscreen?.()}
-          className="bg-white text-black hover:bg-white/90 gap-3 h-11 px-8 rounded-2xl text-[10px] font-black uppercase tracking-widest">
-          <Maximize2 className="w-4 h-4" /> Expand Feed
-        </Button>
       </div>
 
-      <div className="flex-1 grid lg:grid-cols-4 gap-8 overflow-hidden">
-        {/* Left: Feed + Controls */}
-        <div className="lg:col-span-3 flex flex-col gap-6">
+      <div className="premium-glass bg-white/[0.01] border-white/[0.03] rounded-3xl p-4 lg:p-5">
+        <div className="flex flex-wrap gap-2">
+          {TABS.map(tab => (
+            <Button
+              key={tab.id}
+              variant="ghost"
+              size="sm"
+              className={cn("text-[10px] font-black uppercase tracking-[0.15em] px-5 h-9 transition-all rounded-xl",
+                activeTab === tab.id ? "bg-white/[0.08] text-white shadow-xl" : "text-white/30 hover:text-white hover:bg-white/[0.04]")}
+              onClick={() => setActiveTab(tab.id)}
+            >
+              {tab.label}
+            </Button>
+          ))}
+          <button
+            onClick={() => setActiveTab("rtsp")}
+            style={{
+              height: "36px",
+              borderRadius: "12px",
+              border: "1px solid rgba(76,201,240,0.35)",
+              padding: "0 16px",
+              fontSize: "10px",
+              fontWeight: 800,
+              letterSpacing: "0.15em",
+              textTransform: "uppercase",
+              cursor: "pointer",
+              background: activeTab === "rtsp" ? "#4cc9f0" : "transparent",
+              color: activeTab === "rtsp" ? "#000" : "#4cc9f0",
+            }}
+          >
+            📡 RTSP
+          </button>
+        </div>
+      </div>
 
-          {/* Camera Feed */}
-          <div data-live-feed className="flex-1 premium-glass p-1.5 relative group bg-[#050508] shadow-inner-glow ring-2 ring-white/[0.02] overflow-hidden rounded-3xl" style={{ minHeight: "340px" }}>
-            {cameraStatus === "disconnected" && (
-              <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-black/80 backdrop-blur-md">
-                <Wifi className="w-12 h-12 text-red-500 mb-4 animate-pulse" />
-                <span className="text-xl font-black text-white tracking-widest">CONNECTION LOST</span>
-                <span className="text-sm text-white/50 uppercase tracking-[0.2em] mt-2">Attempting to reconnect...</span>
+      <section className="grid grid-cols-1 xl:grid-cols-3 gap-6">
+        <div className="xl:col-span-2 space-y-6">
+          <div
+            ref={fullScreenRef}
+            data-live-feed
+            className={cn(
+              "premium-glass relative aspect-video bg-black rounded-3xl overflow-hidden border border-white/[0.06]",
+              isFullScreen && "fixed inset-0 z-50 w-full h-full rounded-none"
+            )}
+          >
+            <img ref={imgRef} className="w-full h-full object-contain" alt="Live feed" />
+            <AnimatePresence>
+              {!isSocketConnected && (
+                <motion.div
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  className="absolute inset-0 bg-black/70 flex flex-col items-center justify-center text-center"
+                >
+                  <Loader2 className="w-10 h-10 text-primary animate-spin mb-4" />
+                  <p className="text-lg font-bold">Connecting to Safety Engine...</p>
+                  <p className="text-sm text-gray-400">Please wait.</p>
+                </motion.div>
+              )}
+            </AnimatePresence>
+            {streamError && (
+              <div className="absolute inset-0 bg-black/80 flex flex-col items-center justify-center text-center p-4">
+                <XCircle className="w-12 h-12 text-red-500 mb-4" />
+                <p className="text-xl font-bold text-red-400">Stream Error</p>
+                <p className="text-gray-300 mt-2">{streamError}</p>
               </div>
             )}
-            {cameraStatus === "connecting" && (
-              <div className="absolute inset-0 z-50 flex flex-col items-center justify-center bg-black/80 backdrop-blur-md">
-                <Loader2 className="w-12 h-12 text-orange-400 mb-4 animate-spin" />
-                <span className="text-xl font-black text-white tracking-widest">ESTABLISHING CONNECTION</span>
+            <div className="absolute top-4 left-4 flex items-center gap-2">
+              <div className={cn(
+                "flex items-center gap-2 text-xs font-bold py-1 px-3 rounded-full",
+                isSocketConnected ? "bg-green-500/20 text-green-300" : "bg-red-500/20 text-red-300"
+              )}>
+                <span className={cn("w-2 h-2 rounded-full", isSocketConnected ? "bg-green-500 animate-pulse" : "bg-red-500")} />
+                {isSocketConnected ? "CONNECTED" : "DISCONNECTED"}
               </div>
-            )}
-
-            {/* LIVE badge */}
-            <div className="absolute top-4 left-4 z-40 flex items-center gap-2 bg-primary/90 text-white px-3 py-1.5 rounded-full text-[11px] font-black"
-              style={{ display: cameraStatus === "connected" ? "flex" : "none" }}>
-              <span className="w-2 h-2 rounded-full bg-white inline-block animate-pulse" />
-              LIVE
             </div>
-
-            {/* Stat chips */}
-            <div className="absolute top-4 right-4 z-40 flex flex-wrap gap-2">
-              {[
-                { label: "Stability", val: cameraStatus === "connected" ? "99.9%" : "0%", icon: Wifi },
-                { label: "Compute", val: "42ms", icon: Cpu },
-              ].map(s => (
-                <div key={s.label} className="px-3 py-1.5 bg-black/60 backdrop-blur-2xl rounded-xl border border-white/[0.05] flex items-center gap-2">
-                  <s.icon className="w-3 h-3 text-white/30" />
-                  <div className="flex flex-col">
-                    <span className="text-[7px] text-white/20 uppercase font-black tracking-widest">{s.label}</span>
-                    <span className="text-[10px] font-black">{s.val}</span>
+            <div className="absolute bottom-0 left-0 right-0 p-4 bg-gradient-to-t from-black/70 to-transparent">
+              <div className="flex justify-between items-end">
+                <div>
+                  <h2 className="text-2xl font-bold">Main Feed</h2>
+                  <div className="flex items-center gap-2 text-sm text-gray-300">
+                    <MapPin size={16} />
+                    <span>{activeLocationName}</span>
                   </div>
                 </div>
-              ))}
-            </div>
-
-            {/* Live feed img — mutated directly by socket, no React state */}
-            <img ref={imgRef} alt="Live Camera Feed"
-              style={{ width: "100%", height: "100%", objectFit: "cover", display: cameraStatus === "connected" ? "block" : "none" }} />
-            {cameraStatus !== "connected" && (
-              <div className="w-full h-full bg-zinc-900 flex items-center justify-center" style={{ minHeight: "300px" }}>
-                <Video className="w-16 h-16 text-white/10" />
-              </div>
-            )}
-
-            {/* Scanning line */}
-            <div className="absolute inset-8 z-20 pointer-events-none opacity-0 group-hover:opacity-100 transition-opacity duration-700">
-              <motion.div animate={{ top: ["0%", "100%", "0%"] }} transition={{ duration: 6, repeat: Infinity, ease: "linear" }}
-                className="absolute left-0 right-0 h-px bg-primary/40 shadow-[0_0_20px_rgba(230,57,70,0.5)] z-20" />
-            </div>
-
-            {/* Bottom bar */}
-            <div className="absolute bottom-4 left-4 right-4 z-40 p-3 bg-black/40 backdrop-blur-3xl rounded-2xl border border-white/[0.05] flex items-center justify-between opacity-0 group-hover:opacity-100 transition-all duration-500">
-              <div className="flex items-center gap-4">
-                <Button variant="ghost" size="icon" className="w-10 h-10 rounded-xl hover:bg-white/5" onClick={() => setIsLive(!isLive)}>
-                  {isLive ? <Pause className="w-5 h-5 fill-white" /> : <Play className="w-5 h-5 fill-white" />}
-                </Button>
-                <div className="flex flex-col">
-                  <span className="text-xs font-black tracking-widest uppercase">{cameraName}</span>
-                  <span className="text-[8px] text-white/30 uppercase font-black mt-0.5">ENCRYPTED STREAM • AES-256</span>
+                <div className="flex items-center gap-2">
+                  <Button
+                    onClick={() => (videoRef.current?.paused ? videoRef.current?.play() : videoRef.current?.pause())}
+                    size="icon"
+                    variant="ghost"
+                    className="text-white hover:bg-white/10"
+                  >
+                    {isWebcamActive ? <Pause size={20} /> : <Play size={20} />}
+                  </Button>
+                  <Button
+                    onClick={() => setIsFullScreen(!isFullScreen)}
+                    size="icon"
+                    variant="ghost"
+                    className="text-white hover:bg-white/10"
+                  >
+                    <Maximize2 size={20} />
+                  </Button>
                 </div>
               </div>
-              <span className="text-xs font-mono font-bold text-white tracking-widest">
-                {new Date().toLocaleTimeString("en-US", { hour12: false })}
-              </span>
             </div>
           </div>
 
-          {/* Camera Source Panel — tab-based, no prompts */}
           <div className="rounded-3xl premium-glass p-5 bg-white/[0.02] border-white/[0.05] space-y-4">
             <div className="flex items-center gap-2 text-[10px] text-white/40 font-black uppercase tracking-[0.25em]">
               <ChevronRight className="w-4 h-4 text-primary" />
@@ -1536,20 +1772,40 @@ export default function LiveMonitor() {
             </div>
             <LocationPanel onLocationSet={handleLocationSet} />
             {activeTab === "webcam" && (
-              <WebcamTab onActivate={activateWebcam} isActive={activeCamera === "webcam"}
-                detectedLocation={activeLocationName} nearbyAuthorities={nearbyAuthorities}
-                cityAuth={cityAuth} cityAuthLoading={cityAuthLoading}
-                tavilyData={tavilyData} tavilyLoading={tavilyLoading} />
+              <WebcamTab
+                onActivate={activateWebcam}
+                isActive={activeCamera === "webcam"}
+                detectedLocation={activeLocationName}
+                nearbyAuthorities={nearbyAuthorities}
+                cityAuth={cityAuth}
+                cityAuthLoading={cityAuthLoading}
+                tavilyData={tavilyData}
+                tavilyLoading={tavilyLoading}
+              />
             )}
-            {activeTab === "droidcam" && <DroidcamTab onActivate={activateDroidcam} cityAuth={cityAuth} cityAuthLoading={cityAuthLoading} tavilyData={tavilyData} tavilyLoading={tavilyLoading} />}
-            {activeTab === "youtube" && <YoutubeTab onActivate={activateYoutube} selectedLocation={userLocation} nearbyAuthorities={nearbyAuthorities} cityAuth={cityAuth} cityAuthLoading={cityAuthLoading} tavilyData={tavilyData} tavilyLoading={tavilyLoading} />}
+            {activeTab === "droidcam" && (
+              <DroidcamTab
+                onActivate={activateDroidcam}
+                cityAuth={cityAuth}
+                cityAuthLoading={cityAuthLoading}
+                tavilyData={tavilyData}
+                tavilyLoading={tavilyLoading}
+              />
+            )}
+            {activeTab === "youtube" && (
+              <YoutubeTab
+                onActivate={activateYoutube}
+                selectedLocation={userLocation}
+                nearbyAuthorities={nearbyAuthorities}
+                cityAuth={cityAuth}
+                cityAuthLoading={cityAuthLoading}
+                tavilyData={tavilyData}
+                tavilyLoading={tavilyLoading}
+              />
+            )}
             {activeTab === "rtsp" && (
               <div>
-                <p style={{
-                  color: "#888",
-                  fontSize: "12px",
-                  marginBottom: "8px",
-                }}>
+                <p style={{ color: "#888", fontSize: "12px", marginBottom: "8px" }}>
                   Connect any IP camera,
                   DVR or government CCTV
                   that supports RTSP protocol
@@ -1570,11 +1826,7 @@ export default function LiveMonitor() {
                     boxSizing: "border-box",
                   }}
                 />
-                <p style={{
-                  color: "#444",
-                  fontSize: "10px",
-                  marginBottom: "10px",
-                }}>
+                <p style={{ color: "#444", fontSize: "10px", marginBottom: "10px" }}>
                   Examples:
                   rtsp://admin:admin@IP/stream1
                   rtsp://IP:554/live/ch0
@@ -1599,16 +1851,17 @@ export default function LiveMonitor() {
             )}
           </div>
 
-          {/* Stats Row */}
           <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
             {[
-              { label: "Alerts Today", value: stats.total_alerts, icon: Target, color: "text-primary", bg: "bg-primary/10" },
-              { label: "Critical Severity", value: stats.high_severity, icon: ShieldAlert, color: "text-primary", bg: "bg-primary/20", glow: true },
-              { label: "Authorities Alerted", value: stats.authorities_contacted, icon: Siren, color: "text-orange-400", bg: "bg-orange-400/10" },
-              { label: "Active Cameras", value: stats.active_cameras || 1, icon: Radio, color: "text-green-400", bg: "bg-green-400/10" },
+              { label: "Alerts Today", value: stats?.total_alerts ?? 0, icon: Target, color: "text-primary", bg: "bg-primary/10" },
+              { label: "Critical Severity", value: stats?.high_severity ?? 0, icon: ShieldAlert, color: "text-primary", bg: "bg-primary/20", glow: true },
+              { label: "Authorities Alerted", value: stats?.authorities_contacted ?? 0, icon: Siren, color: "text-orange-400", bg: "bg-orange-400/10" },
+              { label: "Active Cameras", value: stats?.active_cameras ?? 0, icon: Radio, color: "text-green-400", bg: "bg-green-400/10" },
             ].map((stat, idx) => (
-              <div key={idx} className={cn("premium-glass p-5 bg-white/[0.02] border-white/[0.04] flex flex-col gap-3 group hover:bg-white/[0.04] rounded-2xl",
-                stat.glow && "red-glow-soft ring-1 ring-primary/20")}>
+              <div key={idx} className={cn(
+                "premium-glass p-5 bg-white/[0.02] border-white/[0.04] flex flex-col gap-3 group hover:bg-white/[0.04] rounded-2xl",
+                stat.glow && "red-glow-soft ring-1 ring-primary/20"
+              )}>
                 <div className="flex items-center justify-between">
                   <div className={cn("p-2 rounded-xl border border-white/5", stat.bg)}>
                     <stat.icon className={cn("w-4 h-4", stat.color)} />
@@ -1624,104 +1877,122 @@ export default function LiveMonitor() {
           </div>
         </div>
 
-        {/* Right: Live Alerts Feed + Groq Vision */}
-        <div className="lg:col-span-1 flex flex-col gap-6 max-h-[85vh]">
-          <GroqSidebar groqData={groqData} groqLog={groqLog} />
+        <div className="xl:col-span-1 space-y-6">
+          <GeminiSidebar geminiData={geminiData} geminiLog={geminiLog} />
 
-          <div className="flex items-center justify-between px-2">
-            <div className="flex flex-col">
-              <h3 className="text-[10px] font-black uppercase tracking-[0.4em] text-white/30">Safety Engine</h3>
-              <span className="text-lg font-black tracking-tighter flex items-center gap-2">
-                LIVE ACTIVITY
-                <span className="relative flex h-3 w-3">
-                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-primary opacity-75" />
-                  <span className="relative inline-flex rounded-full h-3 w-3 bg-primary" />
+          <div className="space-y-4">
+            <div className="flex items-center justify-between px-2">
+              <div className="flex flex-col">
+                <h3 className="text-[10px] font-black uppercase tracking-[0.4em] text-white/30">Safety Engine</h3>
+                <span className="text-lg font-black tracking-tighter flex items-center gap-2">
+                  LIVE ACTIVITY
+                  <span className="relative flex h-3 w-3">
+                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-primary opacity-75" />
+                    <span className="relative inline-flex rounded-full h-3 w-3 bg-primary" />
+                  </span>
                 </span>
-              </span>
+              </div>
+              <Button variant="ghost" size="icon" className="w-10 h-10 rounded-xl hover:bg-white/5">
+                <MoreVertical size={24} className="text-gray-400" />
+              </Button>
             </div>
-            <Button variant="ghost" size="icon" className="w-10 h-10 rounded-xl hover:bg-white/5">
-              <MoreVertical className="w-4 h-4 text-white/40" />
-            </Button>
-          </div>
 
-          {alerts.length === 0 && (
-            <div className="flex flex-col items-center justify-center py-16 text-center">
-              <ShieldAlert className="w-10 h-10 text-white/10 mb-3" />
-              <div className="text-[10px] text-white/20 uppercase tracking-widest font-black">No alerts yet</div>
-              <div className="text-[10px] text-white/10 uppercase tracking-widest mt-1">System is monitoring</div>
-            </div>
-          )}
+            {alerts.length === 0 && (
+              <div className="flex flex-col items-center justify-center py-16 text-center premium-glass rounded-2xl bg-white/[0.01] border-white/[0.04]">
+                <ShieldAlert className="w-10 h-10 text-white/10 mb-3" />
+                <div className="text-[10px] text-white/20 uppercase tracking-widest font-black">No alerts yet</div>
+                <div className="text-[10px] text-white/10 uppercase tracking-widest mt-1">System is monitoring</div>
+              </div>
+            )}
 
-          <div className="flex-1 overflow-auto space-y-4 pr-3 scrollbar-hide pb-20">
-            <AnimatePresence initial={false}>
-              {alerts.map((alert) => {
-                const status = getSeverityStatus(alert.severity_score);
-                return (
-                  <motion.div key={alert.id} initial={{ opacity: 0, height: 0, y: -20 }}
-                    animate={{ opacity: 1, height: "auto", y: 0 }} exit={{ opacity: 0, scale: 0.9, height: 0 }}
-                    className={cn("premium-glass p-4 bg-white/[0.02] border-white/[0.05] group cursor-pointer transition-all hover:bg-white/[0.06] border-l-4 rounded-2xl",
-                      status === "high" ? "border-l-primary" : status === "medium" ? "border-l-orange-500" : "border-l-green-500")}>
-                    <div className="flex flex-col gap-3">
-                      <div className="flex justify-between items-start">
-                        <h4 className="text-xs font-black tracking-tight leading-tight uppercase group-hover:text-primary transition-colors flex items-center gap-2">
-                          <ShieldAlert className="w-4 h-4" />{alert.incident_type}
-                        </h4>
-                        <div className={cn("text-[10px] font-black px-1.5 py-0.5 rounded-lg uppercase tracking-widest whitespace-nowrap",
-                          status === "high" ? "bg-primary/20 text-primary" : status === "medium" ? "bg-orange-500/20 text-orange-400" : "bg-green-500/20 text-green-400")}>
-                          {alert.severity_score}/10
-                        </div>
-                      </div>
-
-                      {alert.screenshot && (
-                        <div className="w-full h-28 rounded-xl overflow-hidden relative">
-                          <img src={`data:image/jpeg;base64,${alert.screenshot}`}
-                            className="w-full h-full object-cover grayscale brightness-75 group-hover:grayscale-0 group-hover:brightness-100 transition-all duration-700"
-                            alt="Incident" onClick={() => window.open(`data:image/jpeg;base64,${alert.screenshot}`, "_blank")} />
-                          <div className="absolute inset-0 bg-gradient-to-t from-black/80 to-transparent pointer-events-none" />
-                          <div className="absolute bottom-2 left-2 text-[9px] uppercase font-black tracking-widest bg-black/60 px-2 py-0.5 rounded border border-white/10">{alert.feature_name}</div>
-                        </div>
+            <div className="space-y-4 max-h-[56vh] overflow-y-auto pr-1">
+              <AnimatePresence initial={false}>
+                {alerts.map((alert) => {
+                  const status = getSeverityStatus(alert.severity_score);
+                  return (
+                    <motion.div
+                      key={alert.id}
+                      initial={{ opacity: 0, height: 0, y: -20 }}
+                      animate={{ opacity: 1, height: "auto", y: 0 }}
+                      exit={{ opacity: 0, scale: 0.9, height: 0 }}
+                      className={cn(
+                        "premium-glass p-4 bg-white/[0.02] border-white/[0.05] group cursor-pointer transition-all hover:bg-white/[0.06] border-l-4 rounded-2xl",
+                        status === "high" ? "border-l-primary" : status === "medium" ? "border-l-orange-500" : "border-l-green-500"
                       )}
+                    >
+                      <div className="flex flex-col gap-3">
+                        <div className="flex justify-between items-start">
+                          <h4 className="text-xs font-black tracking-tight leading-tight uppercase group-hover:text-primary transition-colors flex items-center gap-2">
+                            <ShieldAlert className="w-4 h-4" />{alert.incident_type}
+                          </h4>
+                          <div className={cn(
+                            "text-[10px] font-black px-1.5 py-0.5 rounded-lg uppercase tracking-widest whitespace-nowrap",
+                            status === "high" ? "bg-primary/20 text-primary" : status === "medium" ? "bg-orange-500/20 text-orange-400" : "bg-green-500/20 text-green-400"
+                          )}>
+                            {alert.severity_score}/10
+                          </div>
+                        </div>
 
-                      <div className="text-[10px] text-white/50 leading-relaxed">{alert.groq_description}</div>
+                        {alert.screenshot && (
+                          <div className="w-full h-28 rounded-xl overflow-hidden relative">
+                            <img
+                              src={`data:image/jpeg;base64,${alert.screenshot}`}
+                              className="w-full h-full object-cover grayscale brightness-75 group-hover:grayscale-0 group-hover:brightness-100 transition-all duration-700"
+                              alt="Incident"
+                              onClick={() => window.open(`data:image/jpeg;base64,${alert.screenshot}`, "_blank")}
+                            />
+                            <div className="absolute inset-0 bg-gradient-to-t from-black/80 to-transparent pointer-events-none" />
+                            <div className="absolute bottom-2 left-2 text-[9px] uppercase font-black tracking-widest bg-black/60 px-2 py-0.5 rounded border border-white/10">
+                              {alert.feature_name}
+                            </div>
+                          </div>
+                        )}
 
-                      <NearbyAuthorities nearby={alert.nearby_authorities} />
+                        <div className="text-[10px] text-white/50 leading-relaxed">{alert.gemini_description}</div>
 
-                      <div className="flex items-center gap-1.5 text-[10px] font-black uppercase tracking-widest text-white/40">
-                        <MapPin className="w-3 h-3 text-primary/60" />
-                        <span className="truncate">{alert.location}</span>
-                      </div>
+                        <NearbyAuthorities nearby={alert.nearby_authorities} />
 
-                      <div className="flex items-center gap-2 mt-1 pt-2 border-t border-white/5">
-                        {alert.alert_channels?.sms && <TooltipIcon icon={MessageCircle} status={alert.alert_channels.sms} label="SMS" />}
-                        {alert.alert_channels?.telegram && <TooltipIcon icon={Smartphone} status={alert.alert_channels.telegram} label="Telegram" />}
-                        {alert.alert_channels?.email && <TooltipIcon icon={Mail} status={alert.alert_channels.email} label="Email" />}
-                        <div className="flex-1 flex justify-end">
-                          <span className="text-[9px] text-white/30 font-black uppercase tracking-widest flex items-center gap-1">
-                            <Clock className="w-3 h-3" />
-                            {alert.timestamp ? new Date(alert.timestamp).toLocaleTimeString("en-US") : "--:--"}
-                          </span>
+                        <div className="flex items-center gap-1.5 text-[10px] font-black uppercase tracking-widest text-white/40">
+                          <MapPin className="w-3 h-3 text-primary/60" />
+                          <span className="truncate">{alert.location}</span>
+                        </div>
+
+                        <div className="flex items-center gap-2 mt-1 pt-2 border-t border-white/5">
+                          {alert.alert_channels?.sms && <TooltipIcon icon={MessageCircle} status={alert.alert_channels.sms} label="SMS" />}
+                          {alert.alert_channels?.telegram && <TooltipIcon icon={Smartphone} status={alert.alert_channels.telegram} label="Telegram" />}
+                          {alert.alert_channels?.email && <TooltipIcon icon={Mail} status={alert.alert_channels.email} label="Email" />}
+                          <div className="flex-1 flex justify-end">
+                            <span className="text-[9px] text-white/30 font-black uppercase tracking-widest flex items-center gap-1">
+                              <Clock className="w-3 h-3" />
+                              {alert.timestamp ? new Date(alert.timestamp).toLocaleTimeString("en-US") : "--:--"}
+                            </span>
+                          </div>
                         </div>
                       </div>
-                    </div>
-                  </motion.div>
-                );
-              })}
-            </AnimatePresence>
+                    </motion.div>
+                  );
+                })}
+              </AnimatePresence>
+            </div>
+
+            {currentAlert && (
+              <EmergencyAlertModal
+                isOpen={alertModalOpen}
+                onClose={() => setAlertModalOpen(false)}
+                incidentType={currentAlert.gemini_description || currentAlert.feature_name || currentAlert.incident_type}
+                location={currentAlert.location}
+                time={new Date(currentAlert.timestamp).toLocaleString()}
+                additionalMessage={currentAlert.gemini_description || currentAlert.description || currentAlert.incident_type}
+                onPlayVoice={handlePlayVoiceAlert}
+                isPlayingVoice={isVoicePlaying}
+              />
+            )}
           </div>
         </div>
-      </div>
-    </div>
-  );
-}
+      </section>
 
-function TooltipIcon({ icon: Icon, status, label }: { icon: any; status?: "sent" | "failed"; label: string }) {
-  if (!status) return null;
-  return (
-    <div className="group/icon relative flex flex-col items-center">
-      <div className={cn("p-1.5 rounded-md border",
-        status === "sent" ? "bg-green-500/10 border-green-500/20 text-green-400" : "bg-red-500/10 border-red-500/20 text-red-500")}>
-        <Icon className="w-3 h-3" />
-      </div>
+      <AdminSetupModal isOpen={isSetupModalOpen} onClose={() => setIsSetupModalOpen(false)} />
+      <EmergencyCallOverlay isOpen={isCallOverlayOpen} onClose={() => setIsCallOverlayOpen(false)} incident={activeCallIncident} />
     </div>
   );
 }

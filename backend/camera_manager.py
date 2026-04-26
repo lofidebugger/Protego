@@ -37,6 +37,7 @@ class CameraManager:
             "resolution": "-",
             "last_frame_time": None,
         }
+        self.last_error: str | None = None
 
     def _log(self, message: str) -> None:
         ts = datetime.now(timezone.utc).isoformat()
@@ -57,6 +58,7 @@ class CameraManager:
             ydl_opts = {
                 "quiet": True,
                 "no_warnings": True,
+                "extractor_args": {"youtube": {"player_client": ["android"]}}
             }
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
@@ -66,6 +68,14 @@ class CameraManager:
                 "duration": int(info.get("duration") or 0),
             }
         except Exception as exc:
+            msg = str(exc)
+            if "Sign in to confirm your age" in msg:
+                self.last_error = (
+                    "YouTube blocked this stream due to age-restriction. "
+                    "Use a non age-restricted stream URL, or provide browser cookies to yt-dlp."
+                )
+            else:
+                self.last_error = f"yt-dlp metadata extraction failed: {msg}"
             self._log(f"yt-dlp info extraction failed: {exc}")
             return None
 
@@ -74,6 +84,8 @@ class CameraManager:
             from vidgear.gears import CamGear
 
             info = self._get_youtube_info(url) or {}
+            if self.last_error and "age-restriction" in self.last_error.lower():
+                return False
             is_live = bool(info.get("is_live", False))
             title = str(info.get("title") or name)
             duration = int(info.get("duration") or 0)
@@ -88,6 +100,7 @@ class CameraManager:
                 logging=False,
                 STREAM_RESOLUTION="best",
                 CAP_PROP_FPS=25,
+                STREAM_PARAMS={"extractor_args": {"youtube": {"player_client": ["android"]}}}
             ).start()
 
             test_frame = None
@@ -140,8 +153,17 @@ class CameraManager:
             self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True, name="CameraCaptureLoop")
             self.capture_thread.start()
             self._log(f"VidGear connected: {title or name}")
+            self.last_error = None
             return True
         except Exception as exc:
+            msg = str(exc)
+            if "Input URL is invalid" in msg:
+                self.last_error = (
+                    self.last_error
+                    or "Invalid or inaccessible YouTube stream URL. It may require login/cookies or be geo/age restricted."
+                )
+            else:
+                self.last_error = f"youtube failed: {msg}"
             self._log(f"youtube failed: {exc}")
             self.is_running = False
             self.status["is_connected"] = False
@@ -175,6 +197,7 @@ class CameraManager:
                 logging=False,
                 STREAM_RESOLUTION="best",
                 CAP_PROP_FPS=25,
+                STREAM_PARAMS={"extractor_args": {"youtube": {"player_client": ["android"]}}}
             ).start()
             self.yt_last_frame_time = time.time()
             self._log("clip restarted from beginning")
@@ -215,6 +238,7 @@ class CameraManager:
 
     def start(self, source_type: str = "webcam", **kwargs: Any) -> bool:
         self.stop()
+        self.last_error = None
 
         if source_type == "youtube":
             youtube_url = str(kwargs.get("youtube_url", "")).strip()
@@ -240,6 +264,7 @@ class CameraManager:
 
             if not cap or not cap.isOpened():
                 self._log(f"failed to open source ({source_type})")
+                self.last_error = f"Failed to open source: {source_type}"
                 if cap:
                     cap.release()
                 return False
@@ -267,6 +292,7 @@ class CameraManager:
             self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True, name="CameraCaptureLoop")
             self.capture_thread.start()
             self._log(f"successfully connected to {source_type} ({camera_name})")
+            self.last_error = None
             
             # Pre-roll delay for network sources to allow ffmpeg/hardware buffers to fill
             if source_type in ["youtube", "ipcam"]:
@@ -276,6 +302,7 @@ class CameraManager:
             return True
         except Exception as exc:
             self._log(f"start error: {exc}")
+            self.last_error = f"start error: {exc}"
             return False
 
     def _capture_loop(self) -> None:
@@ -448,6 +475,9 @@ class CameraManager:
         result = self.start(source_type, **kwargs)
         self._emit_status()
         return result
+
+    def get_last_error(self) -> str | None:
+        return self.last_error
 
     def get_status(self) -> dict[str, Any]:
         return {

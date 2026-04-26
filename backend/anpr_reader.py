@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import os
 import re
 import time
 from datetime import datetime, timezone
@@ -10,9 +11,9 @@ import cv2
 import easyocr
 
 try:
-    from groq import Groq
-except Exception:  # pragma: no cover - allows runtime without Groq client
-    Groq = None
+    import google.generativeai as genai
+except Exception:  # pragma: no cover - allows runtime without Gemini client
+    genai = None
 
 
 class ANPRReader:
@@ -32,12 +33,14 @@ class ANPRReader:
                 self._log(f"EasyOCR CPU init also failed: {cpu_err}. ANPR disabled.")
                 self.reader = None
 
-        self.groq_client = None
-        if Groq is not None:
+        self.gemini_client = None
+        gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+        if genai is not None and gemini_key:
             try:
-                self.groq_client = Groq()
+                genai.configure(api_key=gemini_key)
+                self.gemini_client = genai.GenerativeModel("gemini-2.5-flash")
             except Exception as exc:
-                self._log(f"groq client init failed: {exc}")
+                self._log(f"gemini client init failed: {exc}")
 
         # Indian plate pattern: XX00X(X)0000, e.g. TS09EA4521, MH02AB1234, KA01MG2341
         self.indian_plate_pattern = re.compile(r"^[A-Z]{2}[0-9]{2}[A-Z]{1,2}[0-9]{4}$")
@@ -209,22 +212,20 @@ class ANPRReader:
                     self._update_plate_history(candidate, location)
                     return candidate
         else:
-            self._log("easyocr low confidence or no result, trying groq fallback")
+            self._log("easyocr low confidence or no result, trying gemini fallback")
 
-        fallback = self.groq_fallback(plate_region)
+        fallback = self.gemini_fallback(plate_region)
         if fallback:
             self._update_plate_history(fallback, location)
         return fallback
 
-    def groq_fallback(self, plate_image: Any) -> str | None:
-        if self.groq_client is None:
+    def gemini_fallback(self, plate_image: Any) -> str | None:
+        if self.gemini_client is None:
             return None
 
         try:
-            ok, buffer = cv2.imencode(".jpg", plate_image, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
-            if not ok:
-                return None
-            b64 = base64.b64encode(buffer).decode("utf-8")
+            import PIL.Image
+            pil_img = PIL.Image.fromarray(cv2.cvtColor(plate_image, cv2.COLOR_BGR2RGB))
 
             prompt = (
                 "This is a cropped image of a vehicle number plate from an Indian road. "
@@ -233,26 +234,8 @@ class ANPRReader:
                 "Return nothing else."
             )
 
-            response = self.groq_client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/jpeg;base64,{b64}"},
-                            },
-                        ],
-                    }
-                ],
-                temperature=0.0,
-            )
-
-            text = ""
-            if response and response.choices:
-                text = str(response.choices[0].message.content or "")
+            response = self.gemini_client.generate_content([prompt, pil_img])
+            text = (response.text or "").strip()
 
             cleaned = self.clean_plate_text(text)
             if self.validate_indian_plate(cleaned):
@@ -264,7 +247,7 @@ class ANPRReader:
 
             return None
         except Exception as exc:
-            self._log(f"groq fallback failed: {exc}")
+            self._log(f"gemini fallback failed: {exc}")
             return None
 
     def get_recent_plates(self, seconds: int = 60) -> dict[str, dict[str, Any]]:

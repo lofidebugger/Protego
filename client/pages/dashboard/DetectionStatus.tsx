@@ -74,7 +74,7 @@ interface AlertPreview {
    location: string;
    timestamp: string;
    screenshot: string;
-   groq_description: string;
+   gemini_description: string;
 }
 
 export default function Analytics() {
@@ -484,7 +484,7 @@ export default function Analytics() {
                         <div className="space-y-3">
                            <h4 className="text-[9px] font-black uppercase tracking-[0.4em] text-white/30">AI Triage Context</h4>
                            <p className="text-sm font-medium text-white/70 leading-relaxed p-4 bg-white/5 border border-white/5 rounded-2xl rounded-tr-none">
-                              {selectedAlert.groq_description}
+                              {selectedAlert.gemini_description}
                            </p>
                         </div>
                      </div>

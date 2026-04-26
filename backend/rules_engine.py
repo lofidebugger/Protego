@@ -18,7 +18,7 @@ AUTHORITY_MAPPING: dict[str, list[str]] = {
     "Illegal Dumping Detection": ["municipal"],
     "Reckless Driving": ["traffic"],
     "Early Fire Detection": ["fire", "police"],
-    # New incident types from YouTube Groq Vision
+    # New incident types from YouTube Gemini Vision
     "SHOOTING": ["police"],
     "ROBBERY": ["police"],
     "WEAPON_DETECTED": ["police"],
@@ -264,7 +264,7 @@ class RulesEngine:
 
         # Rule 2 - severity threshold check (with stampede special handling).
         stampede_level = self._derive_stampede_level(detection_data)
-        severity = int(detection_data.get("groq_severity", detection_data.get("severity_score", 0)) or 0)
+        severity = int(detection_data.get("gemini_severity", detection_data.get("severity_score", 0)) or 0)
 
         incident_type = str(detection_data.get("incident_type", feature_name))
         if feature_name == "Stampede Prediction" and stampede_level is not None:
@@ -343,8 +343,8 @@ class RulesEngine:
             "camera_latitude": float(camera_info.get("latitude", 0.0)),
             "camera_longitude": float(camera_info.get("longitude", 0.0)),
             "severity_score": severity,
-            "groq_description": str(
-                detection_data.get("groq_description", detection_data.get("description", f"{feature_name} triggered"))
+            "gemini_description": str(
+                detection_data.get("gemini_description", detection_data.get("description", f"{feature_name} triggered"))
             ),
             "authority_alerted": authority_names,
             "vehicle_plates": detection_data.get("vehicle_plates", []) or [],

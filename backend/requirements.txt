@@ -8,14 +8,14 @@ flask-socketio
 flask-cors
 python-telegram-bot
 requests
-numpy
+numpy<2
 pillow
 yt-dlp>=2024.1.0
+google-generativeai
 groq
 supabase
 python-dotenv
 geopy
-geoapify
 twilio
 gTTS
 deep-sort-realtime
