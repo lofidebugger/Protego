@@ -15,7 +15,8 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements-cloud.txt .
-RUN pip install --no-cache-dir -r requirements-cloud.txt
+RUN pip install --no-cache-dir -r requirements-cloud.txt \
+    && pip install --no-cache-dir -U yt-dlp
 
 COPY . .
 

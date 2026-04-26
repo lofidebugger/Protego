@@ -577,6 +577,16 @@ def switch_camera_source():
         if not success:
             socketio.emit("camera_status", {"status": "disconnected", "camera_name": "Camera", "source_type": source_type})
             detailed = _camera.get_last_error() or "Failed to switch camera source"
+            if source_type == "youtube" and (
+                "blocked all retry attempts" in detailed.lower()
+                or "youtube is blocking this stream" in detailed.lower()
+                or "sign in" in detailed.lower()
+                or "bot" in detailed.lower()
+            ):
+                return jsonify({
+                    "error": True,
+                    "message": "YouTube is blocking this stream. Please try a different public video URL, or use webcam/DroidCam mode instead.",
+                }), 503
             status_code = 400 if source_type == "youtube" else 500
             return err(detailed, status_code)
 

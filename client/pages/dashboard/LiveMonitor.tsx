@@ -1569,6 +1569,15 @@ export default function LiveMonitor() {
       });
       const data = await res.json();
       if (!res.ok) {
+        if (res.status === 503) {
+          toast({
+            title: "YouTube Stream Blocked",
+            description: data?.message || "YouTube is blocking this stream. Please try a different public video URL, or use webcam/DroidCam mode instead.",
+            variant: "destructive"
+          });
+          setCameraStatus("disconnected");
+          return;
+        }
         toast({
           title: "Stream Loading Failed",
           description: data?.error || data?.message || "YouTube stream could not be processed. Please check the URL.",

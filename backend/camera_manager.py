@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import os
 import threading
 import time
 from datetime import datetime, timezone
@@ -8,6 +9,9 @@ from typing import Any, Callable
 
 import cv2
 import numpy as np
+
+
+COOKIES_PATH = os.path.join(os.path.dirname(__file__), "cookies.txt")
 
 
 class CameraManager:
@@ -51,17 +55,91 @@ class CameraManager:
         except Exception as exc:
             self._log(f"status callback error: {exc}")
 
+    def get_ydl_opts(self) -> dict[str, Any]:
+        opts: dict[str, Any] = {
+            "quiet": True,
+            "no_warnings": False,
+            "extractor_retries": 10,
+            "sleep_interval": 3,
+            "max_sleep_interval": 6,
+            "socket_timeout": 30,
+            "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "referer": "https://www.youtube.com/",
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept": "text/html,application/xhtml+xml,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+            "format": "best[ext=mp4]/best",
+            "noplaylist": True,
+            "extractor_args": {"youtube": {"player_client": ["android"]}},
+        }
+        if os.path.exists(COOKIES_PATH):
+            opts["cookiefile"] = COOKIES_PATH
+        return opts
+
+    def _camgear_stream_params(self) -> dict[str, Any]:
+        ydl = self.get_ydl_opts()
+        return {
+            "quiet": ydl.get("quiet"),
+            "no_warnings": ydl.get("no_warnings"),
+            "extractor_retries": ydl.get("extractor_retries"),
+            "sleep_interval": ydl.get("sleep_interval"),
+            "max_sleep_interval": ydl.get("max_sleep_interval"),
+            "socket_timeout": ydl.get("socket_timeout"),
+            "user_agent": ydl.get("user_agent"),
+            "referer": ydl.get("referer"),
+            "http_headers": ydl.get("http_headers"),
+            "format": ydl.get("format"),
+            "noplaylist": ydl.get("noplaylist"),
+            "extractor_args": ydl.get("extractor_args"),
+            **({"cookiefile": ydl.get("cookiefile")} if ydl.get("cookiefile") else {}),
+        }
+
+    def extract_with_retry(self, url: str, retries: int = 3) -> dict[str, Any]:
+        import yt_dlp
+
+        for attempt in range(retries):
+            try:
+                with yt_dlp.YoutubeDL(self.get_ydl_opts()) as ydl:
+                    return ydl.extract_info(url, download=False)
+            except Exception as e:
+                message = str(e)
+                if "Sign in" in message or "bot" in message.lower():
+                    wait = 2 ** attempt
+                    self._log(f"[Protego] Bot detection hit, retrying in {wait}s...")
+                    time.sleep(wait)
+                    continue
+                raise
+        raise Exception("YouTube blocked all retry attempts. Please try a different video URL.")
+
+    def _start_camgear_with_retry(self, url: str, retries: int = 3):
+        from vidgear.gears import CamGear
+
+        stream_params = self._camgear_stream_params()
+        for attempt in range(retries):
+            try:
+                return CamGear(
+                    source=url,
+                    stream_mode=True,
+                    logging=False,
+                    STREAM_RESOLUTION="best",
+                    CAP_PROP_FPS=25,
+                    STREAM_PARAMS=stream_params,
+                ).start()
+            except Exception as e:
+                message = str(e)
+                if "Sign in" in message or "bot" in message.lower():
+                    wait = 2 ** attempt
+                    self._log(f"[Protego] Bot detection hit, retrying stream start in {wait}s...")
+                    time.sleep(wait)
+                    continue
+                raise
+        raise Exception("YouTube blocked all retry attempts. Please try a different video URL.")
+
     def _get_youtube_info(self, url: str) -> dict[str, Any] | None:
         try:
-            import yt_dlp
-
-            ydl_opts = {
-                "quiet": True,
-                "no_warnings": True,
-                "extractor_args": {"youtube": {"player_client": ["android"]}}
-            }
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=False)
+            info = self.extract_with_retry(url, retries=3)
             return {
                 "is_live": bool(info.get("is_live", False)),
                 "title": str(info.get("title") or "YouTube"),
@@ -72,7 +150,12 @@ class CameraManager:
             if "Sign in to confirm your age" in msg:
                 self.last_error = (
                     "YouTube blocked this stream due to age-restriction. "
-                    "Use a non age-restricted stream URL, or provide browser cookies to yt-dlp."
+                    "Use a non age-restricted stream URL, or provide cookies.txt for yt-dlp authentication."
+                )
+            elif "Sign in" in msg or "bot" in msg.lower() or "blocked all retry attempts" in msg.lower():
+                self.last_error = (
+                    "YouTube is blocking this stream. Please try a different public video URL, "
+                    "or use webcam/DroidCam mode instead."
                 )
             else:
                 self.last_error = f"yt-dlp metadata extraction failed: {msg}"
@@ -94,14 +177,7 @@ class CameraManager:
                 f"YouTube info: '{title}' | live={is_live} | duration={duration}s"
             )
 
-            stream = CamGear(
-                source=url,
-                stream_mode=True,
-                logging=False,
-                STREAM_RESOLUTION="best",
-                CAP_PROP_FPS=25,
-                STREAM_PARAMS={"extractor_args": {"youtube": {"player_client": ["android"]}}}
-            ).start()
+            stream = self._start_camgear_with_retry(url, retries=3)
 
             test_frame = None
             deadline = time.time() + 10
@@ -162,6 +238,11 @@ class CameraManager:
                     self.last_error
                     or "Invalid or inaccessible YouTube stream URL. It may require login/cookies or be geo/age restricted."
                 )
+            elif "Sign in" in msg or "bot" in msg.lower() or "blocked all retry attempts" in msg.lower():
+                self.last_error = (
+                    "YouTube is blocking this stream. Please try a different public video URL, "
+                    "or use webcam/DroidCam mode instead."
+                )
             else:
                 self.last_error = f"youtube failed: {msg}"
             self._log(f"youtube failed: {exc}")
@@ -191,14 +272,7 @@ class CameraManager:
                     pass
 
             time.sleep(0.5)
-            self.vidgear_stream = CamGear(
-                source=self.youtube_original,
-                stream_mode=True,
-                logging=False,
-                STREAM_RESOLUTION="best",
-                CAP_PROP_FPS=25,
-                STREAM_PARAMS={"extractor_args": {"youtube": {"player_client": ["android"]}}}
-            ).start()
+            self.vidgear_stream = self._start_camgear_with_retry(self.youtube_original, retries=3)
             self.yt_last_frame_time = time.time()
             self._log("clip restarted from beginning")
         except Exception as exc:
