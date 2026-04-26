@@ -9,6 +9,46 @@ from typing import Any, Callable
 
 import cv2
 import numpy as np
+import requests
+import re
+
+def get_youtube_stream_via_invidious(video_url):
+    # Extract video ID from URL
+    video_id = re.search(
+        r'(?:v=|\/)([0-9A-Za-z_-]{11})', video_url
+    )
+    if not video_id:
+        raise Exception("Invalid YouTube URL")
+    
+    video_id = video_id.group(1)
+    
+    # Try multiple public Invidious instances
+    instances = [
+        "https://invidious.snopyta.org",
+        "https://inv.riverside.rocks", 
+        "https://invidious.kavin.rocks",
+        "https://yt.artemislena.eu",
+        "https://invidious.nerdvpn.de"
+    ]
+    
+    for instance in instances:
+        try:
+            api_url = f"{instance}/api/v1/videos/{video_id}"
+            response = requests.get(api_url, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                # Get best video stream URL
+                formats = data.get('adaptiveFormats', []) + \
+                          data.get('formatStreams', [])
+                for fmt in formats:
+                    if fmt.get('type', '').startswith('video/mp4'):
+                        return fmt['url']
+        except Exception:
+            continue
+    
+    raise Exception(
+        "All Invidious instances failed. Try a different URL."
+    )
 
 
 COOKIES_PATH = os.path.join(os.path.dirname(__file__), "cookies.txt")
@@ -118,26 +158,17 @@ class CameraManager:
     def _start_camgear_with_retry(self, url: str, retries: int = 3):
         from vidgear.gears import CamGear
 
-        stream_params = self._camgear_stream_params()
-        for attempt in range(retries):
-            try:
-                return CamGear(
-                    source=url,
-                    stream_mode=True,
-                    logging=False,
-                    STREAM_RESOLUTION="best",
-                    CAP_PROP_FPS=25,
-                    STREAM_PARAMS=stream_params,
-                ).start()
-            except Exception as e:
-                message = str(e)
-                if "Sign in" in message or "bot" in message.lower():
-                    wait = 2 ** attempt
-                    self._log(f"[Protego] Bot detection hit, retrying stream start in {wait}s...")
-                    time.sleep(wait)
-                    continue
-                raise
-        raise Exception("YouTube blocked all retry attempts. Please try a different video URL.")
+        try:
+            stream_url = get_youtube_stream_via_invidious(url)
+            return CamGear(source=stream_url, logging=True).start()
+        except Exception as e:
+            self._log(f"Invidious failed: {e}. Falling back to yt-dlp.")
+            # fallback to yt-dlp
+            return CamGear(
+                source=url,
+                stream_mode=True,
+                **{"yt_dlp_opts": self.get_ydl_opts()}
+            ).start()
 
     def _get_youtube_info(self, url: str) -> dict[str, Any] | None:
         try:
