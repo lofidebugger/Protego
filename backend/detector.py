@@ -14,8 +14,15 @@ from typing import Any
 
 import cv2
 import numpy as np
-import torch
-from ultralytics import YOLO
+try:
+    import torch
+except Exception:  # pragma: no cover
+    torch = None
+
+try:
+    from ultralytics import YOLO
+except Exception:  # pragma: no cover
+    YOLO = None
 
 try:
     import easyocr
@@ -76,7 +83,7 @@ class Detector:
     def __init__(self, settings_provider: Any = None) -> None:
         self.settings_provider = settings_provider
         self.device = "cpu"
-        if torch.cuda.is_available():
+        if torch is not None and torch.cuda.is_available():
             try:
                 # Smoke test: attempt a real computation on CUDA.
                 # This will raise an error for architectures not supported by
@@ -276,7 +283,7 @@ class Detector:
         # 4. EasyOCR
         if easyocr is not None:
             try:
-                self.ocr_reader = easyocr.Reader(["en"], gpu=torch.cuda.is_available())
+                self.ocr_reader = easyocr.Reader(["en"], gpu=bool(torch is not None and torch.cuda.is_available()))
                 self._log("EasyOCR loaded")
             except Exception as exc:
                 self._log(f"easyocr init failed: {exc}")
