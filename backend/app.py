@@ -79,6 +79,16 @@ _detector = Detector(settings_provider=_db)
 _rules = RulesEngine(database=_db, alert_system=_alert_system)
 
 
+latest_system_state: dict[str, Any] = {
+    "gemini_analysis": None,
+    "detections": [],
+    "latest_alert": None,
+    "camera_status": "disconnected",
+    "timestamp": 0
+}
+state_lock = threading.Lock()
+
+
 COLOR_BY_DRAW_TYPE = {
     "distress": "#e63946",
     "accident": "#f4a261",
@@ -124,17 +134,9 @@ _runtime = {
     "gemini_vision_loop_running": False,
 }
 
+latest_gemini_result: dict[str, Any] | None = None
 gemini_vision_running = False
 gemini_vision_lock = threading.Lock()
-latest_gemini_result: dict[str, Any] | None = None
-latest_system_state: dict[str, Any] = {
-    "gemini_analysis": None,
-    "detections": [],
-    "latest_alert": None,
-    "camera_status": "disconnected",
-    "timestamp": 0
-}
-state_lock = threading.Lock()
 
 _active_location = {
     "mode": "manual",
@@ -396,21 +398,23 @@ def handle_gemini_threat(threat: dict[str, Any], frame: Any, full_result: dict[s
         # socketio.emit("new_alert", frontend_alert)
 
         # socketio.emit(
-            "alert",
-            {
-                "id": f"gemini-yt-{int(now * 1000)}",
-                "incident_type": feature,
-                "feature_name": "Gemini 2.5 Flash",
-                "location": loc_str,
-                "severity_score": severity,
-                "gemini_description": description or str(full_result.get("gemini_reasoning", "")),
-                "authority_alerted": [],
-                "vehicle_plates": [],
-                "screenshot": screenshot,
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "alert_channels": {"telegram": "failed", "sms": "failed", "email": "failed"},
-            },
-        )
+        #     "alert",
+        #     {
+        #         "id": f"gemini-yt-{int(now * 1000)}",
+        #         "incident_type": feature,
+        #         "feature_name": "Gemini 2.5 Flash",
+        #         "location": loc_str,
+        #         "severity_score": severity,
+        #         "gemini_description": description or str(full_result.get("gemini_reasoning", "")),
+        #         "authority_alerted": [],
+        #         "vehicle_plates": [],
+        #         "screenshot": screenshot,
+        #         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        #         "alert_channels": {"telegram": "failed", "sms": "failed", "email": "failed"},
+        #     },
+        # )
+
+
 
         _log(f"PROTEGO ALERT {feature} severity {severity}/10")
 
