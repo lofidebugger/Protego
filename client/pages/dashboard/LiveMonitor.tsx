@@ -1537,31 +1537,30 @@ export default function LiveMonitor() {
         streamRef.current = stream;
         if (videoRef.current) {
           videoRef.current.srcObject = stream;
-          videoRef.current.play();
-        }
 
-        intervalId = setInterval(() => {
-          if (videoRef.current && canvasRef.current && socket) {
-            const canvas = canvasRef.current;
-            const video = videoRef.current;
-            if (video.videoWidth > 0 && video.videoHeight > 0) {
+          videoRef.current.onloadedmetadata = () => {
+            videoRef.current!.play();
+
+            intervalId = setInterval(() => {
+              const video = videoRef.current;
+              if (!video || video.readyState < 2 || video.videoWidth === 0) return;
+
+              const canvas = document.createElement('canvas');
               canvas.width = video.videoWidth;
               canvas.height = video.videoHeight;
               const ctx = canvas.getContext('2d');
               if (ctx) {
                 ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-                // Convert to base64 JPEG
                 const base64Data = canvas.toDataURL('image/jpeg', 0.8);
-                // socket.emit("webrtc_frame", { frame: base64Data });
                 fetch(`${API}/api/webcam/frame`, {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({ frame: base64Data })
                 }).catch(err => console.error("Webcam upload failed:", err));
               }
-            }
-          }
-        }, 2000);
+            }, 2000);
+          };
+        }
       } catch (err) {
         console.error("Error accessing webcam: ", err);
         toast({ title: "Webcam Access Denied", description: "Please allow webcam access in your browser.", variant: "destructive" });
@@ -1585,7 +1584,7 @@ export default function LiveMonitor() {
     return () => {
       stopWebcam();
     };
-  }, [activeCamera, socket, toast]);
+  }, [activeCamera, toast]);
 
   // Activate webcam
   const activateWebcam = async () => {
