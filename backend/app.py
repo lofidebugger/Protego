@@ -27,7 +27,7 @@ from werkzeug.utils import secure_filename
 import cv2
 import requests
 from flask import Flask, Response, jsonify, request
-from flask_cors import CORS
+from flask_cors import CORS, cross_origin
 from flask_socketio import SocketIO
 
 from alert_system import AlertSystem
@@ -57,11 +57,9 @@ def err(message: str, status_code: int = 500):
 async_mode = "threading"
 
 app = Flask(__name__)
-CORS(
-    app,
-    resources={r"/*": {"origins": "*"}},
-    supports_credentials=True,
-)
+CORS(app, origins="*", 
+     allow_headers=["Content-Type", "Authorization"],
+     methods=["GET", "POST", "OPTIONS"])
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
@@ -79,7 +77,7 @@ _detector = Detector(settings_provider=_db)
 _rules = RulesEngine(database=_db, alert_system=_alert_system)
 
 
-latest_system_state: dict[str, Any] = {
+latest_detection: dict[str, Any] = {
     "gemini_analysis": None,
     "detections": [],
     "latest_alert": None,
@@ -121,7 +119,7 @@ def _camera_status_callback(status: dict[str, Any]) -> None:
         "source_type": status.get("source_type"),
     }
     with state_lock:
-        latest_system_state["camera_status"] = payload
+        latest_detection["camera_status"] = payload
     socketio.emit("camera_status", payload)
 
 
@@ -289,7 +287,7 @@ def detection_loop() -> None:
             detections = results.get("detections", []) or []
             normalized = [_normalize_detection_for_frontend(d) for d in detections]
             with state_lock:
-                latest_system_state["detections"] = normalized
+                latest_detection["detections"] = normalized
             # socketio.emit(
             #     "detections",
             #     {"detections": normalized},
@@ -298,8 +296,8 @@ def detection_loop() -> None:
             gemini_analysis = results.get("gemini_analysis")
             if gemini_analysis:
                 with state_lock:
-                    latest_system_state["gemini_analysis"] = gemini_analysis
-                    latest_system_state["timestamp"] = time.time()
+                    latest_detection["gemini_analysis"] = gemini_analysis
+                    latest_detection["timestamp"] = time.time()
                 # socketio.emit("gemini_analysis", gemini_analysis)
 
             gemini_alerts = results.get("gemini_alerts", []) or []
@@ -325,8 +323,8 @@ def detection_loop() -> None:
             confirmed_alerts = _rules.process_detections(results, camera_info)
             for alert_obj in confirmed_alerts:
                 with state_lock:
-                    latest_system_state["latest_alert"] = alert_obj
-                    latest_system_state["timestamp"] = time.time()
+                    latest_detection["latest_alert"] = alert_obj
+                    latest_detection["timestamp"] = time.time()
                 # socketio.emit("alert", alert_obj)
                 popup = alert_obj.get("pending_popup")
                 if popup:
@@ -393,8 +391,8 @@ def handle_gemini_threat(threat: dict[str, Any], frame: Any, full_result: dict[s
             "screenshot": screenshot,
         }
         with state_lock:
-            latest_system_state["latest_alert"] = frontend_alert
-            latest_system_state["timestamp"] = time.time()
+            latest_detection["latest_alert"] = frontend_alert
+            latest_detection["timestamp"] = time.time()
         # socketio.emit("new_alert", frontend_alert)
 
         # socketio.emit(
@@ -483,8 +481,8 @@ def gemini_vision_loop() -> None:
                 latest_gemini_result = result
 
             with state_lock:
-                latest_system_state["gemini_analysis"] = result
-                latest_system_state["timestamp"] = time.time()
+                latest_detection["gemini_analysis"] = result
+                latest_detection["timestamp"] = time.time()
             # socketio.emit("gemini_analysis", result)
 
             threats = result.get("threats", [])
@@ -966,12 +964,14 @@ def stats_today():
 
 
 @app.route('/api/detections/latest', methods=['GET'])
+@cross_origin()
 def get_latest_detection():
     with state_lock:
-        return jsonify(latest_system_state)
+        return jsonify(latest_detection)
 
 
 @app.route('/api/webcam/frame', methods=['POST'])
+@cross_origin()
 def handle_webcam_frame_post():
     data = request.json
     if not data or "frame" not in data:
