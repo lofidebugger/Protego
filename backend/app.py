@@ -20,6 +20,8 @@ import random
 import string
 from datetime import datetime, timezone
 from typing import Any
+import base64
+import numpy as np
 from werkzeug.utils import secure_filename
 
 import cv2
@@ -108,6 +110,8 @@ def _camera_status_callback(status: dict[str, Any]) -> None:
         "camera_name": status.get("camera_name"),
         "source_type": status.get("source_type"),
     }
+    with state_lock:
+        latest_system_state["camera_status"] = payload
     socketio.emit("camera_status", payload)
 
 
@@ -123,6 +127,14 @@ _runtime = {
 gemini_vision_running = False
 gemini_vision_lock = threading.Lock()
 latest_gemini_result: dict[str, Any] | None = None
+latest_system_state: dict[str, Any] = {
+    "gemini_analysis": None,
+    "detections": [],
+    "latest_alert": None,
+    "camera_status": "disconnected",
+    "timestamp": 0
+}
+state_lock = threading.Lock()
 
 _active_location = {
     "mode": "manual",
@@ -273,14 +285,20 @@ def detection_loop() -> None:
                     socketio.emit("frame", {"frame": b64})
 
             detections = results.get("detections", []) or []
-            socketio.emit(
-                "detections",
-                {"detections": [_normalize_detection_for_frontend(d) for d in detections]},
-            )
+            normalized = [_normalize_detection_for_frontend(d) for d in detections]
+            with state_lock:
+                latest_system_state["detections"] = normalized
+            # socketio.emit(
+            #     "detections",
+            #     {"detections": normalized},
+            # )
 
             gemini_analysis = results.get("gemini_analysis")
             if gemini_analysis:
-                socketio.emit("gemini_analysis", gemini_analysis)
+                with state_lock:
+                    latest_system_state["gemini_analysis"] = gemini_analysis
+                    latest_system_state["timestamp"] = time.time()
+                # socketio.emit("gemini_analysis", gemini_analysis)
 
             gemini_alerts = results.get("gemini_alerts", []) or []
             for gemini_alert in gemini_alerts:
@@ -304,7 +322,10 @@ def detection_loop() -> None:
             camera_info = _build_camera_info()
             confirmed_alerts = _rules.process_detections(results, camera_info)
             for alert_obj in confirmed_alerts:
-                socketio.emit("alert", alert_obj)
+                with state_lock:
+                    latest_system_state["latest_alert"] = alert_obj
+                    latest_system_state["timestamp"] = time.time()
+                # socketio.emit("alert", alert_obj)
                 popup = alert_obj.get("pending_popup")
                 if popup:
                     socketio.emit("popup", popup)
@@ -369,9 +390,12 @@ def handle_gemini_threat(threat: dict[str, Any], frame: Any, full_result: dict[s
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             "screenshot": screenshot,
         }
-        socketio.emit("new_alert", frontend_alert)
+        with state_lock:
+            latest_system_state["latest_alert"] = frontend_alert
+            latest_system_state["timestamp"] = time.time()
+        # socketio.emit("new_alert", frontend_alert)
 
-        socketio.emit(
+        # socketio.emit(
             "alert",
             {
                 "id": f"gemini-yt-{int(now * 1000)}",
@@ -454,7 +478,10 @@ def gemini_vision_loop() -> None:
             with gemini_vision_lock:
                 latest_gemini_result = result
 
-            socketio.emit("gemini_analysis", result)
+            with state_lock:
+                latest_system_state["gemini_analysis"] = result
+                latest_system_state["timestamp"] = time.time()
+            # socketio.emit("gemini_analysis", result)
 
             threats = result.get("threats", [])
             for threat in threats:
@@ -932,6 +959,34 @@ def stats_today():
         )
     except Exception as exc:
         return err(str(exc), 500)
+
+
+@app.route('/api/detections/latest', methods=['GET'])
+def get_latest_detection():
+    with state_lock:
+        return jsonify(latest_system_state)
+
+
+@app.route('/api/webcam/frame', methods=['POST'])
+def handle_webcam_frame_post():
+    data = request.json
+    if not data or "frame" not in data:
+        return jsonify({"success": False, "error": "No frame data"}), 400
+
+    b64 = data["frame"]
+    if "base64," in b64:
+        b64 = b64.split("base64,")[1]
+
+    try:
+        img_data = base64.b64decode(b64)
+        nparr = np.frombuffer(img_data, np.uint8)
+        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        if frame is not None:
+            _camera.set_webrtc_frame(frame)
+            return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+    return jsonify({"success": False, "error": "Invalid image"}), 400
 
 
 @app.get("/api/system/stats")

@@ -1128,6 +1128,7 @@ function YoutubeTab({
 // ── Main Component ─────────────────────────────────────────────────────────
 export default function LiveMonitor() {
   const { toast } = useToast();
+  const lastProcessedTsRef = useRef(0);
   const [socket, setSocket] = useState<any>(null);
   const [isSocketConnected, setIsSocketConnected] = useState(false);
   const [isWebcamActive, setIsWebcamActive] = useState(false);
@@ -1442,46 +1443,12 @@ export default function LiveMonitor() {
         imgRef.current.src = `data:image/jpeg;base64,${b64}`;
       }
     });
-    socket.on("new_alert", (data: Alert) => {
-      console.log("New alert received:", data);
-      setLatestAlert(data);
-      setAlertHistory((prev) => [data, ...prev.slice(0, 4)]);
-      openLiveAlertPopup(data);
-      toast({
-        title: "🚨 New High-Severity Alert!",
-        description: `${data.incident_type} detected at ${data.location}.`,
-        variant: "destructive",
-      });
-    });
-    socket.on("alert", (alert: Alert) => {
-      setAlerts(prev => [alert, ...prev].slice(0, 50));
-      setStats(prev => ({
-        ...prev, total_alerts: prev.total_alerts + 1,
-        high_severity: alert.severity_score >= 7 ? prev.high_severity + 1 : prev.high_severity,
-        authorities_contacted: prev.authorities_contacted + (alert.authority_alerted?.length ? 1 : 0),
-      }));
-
-      // Trigger Call Overlay for high severity threats ONLY if alerts are set up
-      if (alert.severity_score >= 7 && isAlertsConfigured) {
-        setActiveCallIncident({
-          incident_type: alert.incident_type,
-          location: alert.location || activeLocationName || "Unknown Location",
-          severity: alert.severity_score
-        });
-        setIsCallOverlayOpen(true);
-      }
-    });
-    socket.on("stats_update", (data: Stats) => {
-      setStats(data);
-    });
-    socket.on("camera_status", (data: any) => {
-      setCameraStatus(data.status);
-      if (data.camera_name || data.name) setCameraName(data.camera_name || data.name);
-    });
-    socket.on("gemini_analysis", (data: GeminiAnalysis) => {
-      setGeminiData(data);
-      setGeminiLog(prev => [data, ...prev.slice(0, 29)]);
-    });
+    // Detection data moved to polling for GCloud Run stability
+    /*
+    socket.on("new_alert", (data: Alert) => { ... });
+    socket.on("alert", (alert: Alert) => { ... });
+    socket.on("gemini_analysis", (data: GeminiAnalysis) => { ... });
+    */
     socket.on("gemini_reset", () => {
       setGeminiData(null);
       setGeminiLog([]);
@@ -1507,11 +1474,58 @@ export default function LiveMonitor() {
       setTavilyLoading(false);
     });
     return () => {
-      socket.off("city_authorities");
-      socket.off("city_authorities_loading");
       socket.disconnect();
     };
-  }, [fetchAuthorities, loadMajorAuthorities, toast, activeLocationName, isAlertsConfigured]);
+  }, [toast]);
+
+  // Polling for detection results (GCloud Run compatibility)
+  useEffect(() => {
+    const pollInterval = setInterval(async () => {
+      try {
+        const res = await fetch(`${API}/api/detections/latest`);
+        const data = await res.json();
+        
+        if (!data || data.timestamp <= lastProcessedTsRef.current) return;
+        lastProcessedTsRef.current = data.timestamp;
+
+        if (data.camera_status) {
+          setCameraStatus(data.camera_status.status);
+          if (data.camera_status.camera_name) setCameraName(data.camera_status.camera_name);
+        }
+
+        if (data.gemini_analysis) {
+          setGeminiData(data.gemini_analysis);
+          setGeminiLog(prev => {
+            if (prev[0]?.timestamp === data.gemini_analysis.timestamp) return prev;
+            return [data.gemini_analysis, ...prev.slice(0, 29)];
+          });
+        }
+
+        if (data.latest_alert) {
+          const alert = data.latest_alert;
+          // Check if this is a new alert by ID or timestamp
+          setLatestAlert(alert);
+          setAlertHistory(prev => {
+            if (prev.find(a => a.id === alert.id)) return prev;
+            return [alert, ...prev].slice(0, 4);
+          });
+          
+          if (alert.severity_score >= 7) {
+            openLiveAlertPopup(alert);
+            toast({
+              title: "🚨 New High-Severity Alert!",
+              description: `${alert.incident_type} detected.`,
+              variant: "destructive",
+            });
+          }
+        }
+      } catch (e) {
+        console.error("Polling failed:", e);
+      }
+    }, 2500);
+
+    return () => clearInterval(pollInterval);
+  }, [toast, openLiveAlertPopup]);
 
   // WebRTC capture for Webcam mode
   useEffect(() => {
@@ -1538,7 +1552,12 @@ export default function LiveMonitor() {
                 ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
                 // Convert to base64 JPEG
                 const base64Data = canvas.toDataURL('image/jpeg', 0.8);
-                socket.emit("webrtc_frame", { frame: base64Data });
+                // socket.emit("webrtc_frame", { frame: base64Data });
+                fetch(`${API}/api/webcam/frame`, {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  body: JSON.stringify({ frame: base64Data })
+                }).catch(err => console.error("Webcam upload failed:", err));
               }
             }
           }
