@@ -26,7 +26,7 @@ from werkzeug.utils import secure_filename
 
 import cv2
 import requests
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, jsonify, request, make_response
 from flask_cors import CORS, cross_origin
 from flask_socketio import SocketIO
 
@@ -57,9 +57,23 @@ def err(message: str, status_code: int = 500):
 async_mode = "threading"
 
 app = Flask(__name__)
-CORS(app, origins="*", 
-     allow_headers=["Content-Type", "Authorization"],
-     methods=["GET", "POST", "OPTIONS"])
+CORS(app, origins="*")
+
+@app.before_request
+def handle_preflight():
+    if request.method == "OPTIONS":
+        response = make_response()
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        response.headers.add("Access-Control-Allow-Headers", "*")
+        response.headers.add("Access-Control-Allow-Methods", "*")
+        return response
+
+@app.after_request
+def after_request(response):
+    response.headers.add("Access-Control-Allow-Origin", "*")
+    response.headers.add("Access-Control-Allow-Headers", "Content-Type, Authorization")
+    response.headers.add("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+    return response
 socketio = SocketIO(
     app,
     cors_allowed_origins="*",
@@ -964,14 +978,12 @@ def stats_today():
 
 
 @app.route('/api/detections/latest', methods=['GET'])
-@cross_origin()
 def get_latest_detection():
     with state_lock:
         return jsonify(latest_detection)
 
 
 @app.route('/api/webcam/frame', methods=['POST'])
-@cross_origin()
 def handle_webcam_frame_post():
     data = request.json
     if not data or "frame" not in data:
